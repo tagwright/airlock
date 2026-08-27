@@ -103,8 +103,27 @@ FROM debian:stable-slim
 ARG IG_VERSION=0.55.1
 ARG IG_SHA256=6fda46b7c973fc063f1ea0b9ef61327e8bd1c0c5ce2383d6b9710d3dcfd3ca39
 
+#
+# runc is NOT here to run anything: airlock never launches a container of
+# its own. It is here because ig's container-collection subsystem watches
+# for container start/stop by fanotify-monitoring a container runtime
+# BINARY on ITS OWN filesystem (this image's, not the host's) at one of a
+# fixed list of well-known paths (/usr/bin/runc, /usr/sbin/runc, and a
+# dozen others -- see RUNTIME_PATH in `ig`'s own error text). BUG FIX
+# (this integration pass): confirmed against a real v0.55.1 `ig run`
+# inside this exact image, with every other documented mount and flag
+# already correct (--privileged, --pid=host, the docker socket, the
+# runtime flag, --auto-mount-filesystems): without a runc binary present
+# at one of those paths, container-collection's fanotify setup fails
+# ("no container runtime can be monitored with fanotify"), which fails
+# container-collection ENTIRELY, which fails ig's whole startup -- on
+# EVERY gadget, every time, with zero events ever produced. This is
+# independent of, and more fundamental than, the --auto-mount-filesystems
+# and ig.DefaultRuntimes fixes elsewhere in this pass: even with both of
+# those correct, this image could not observe anything at all without
+# runc physically present in it.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && apt-get install -y --no-install-recommends ca-certificates curl runc \
     && curl -fsSL -o /tmp/ig.tar.gz "https://github.com/inspektor-gadget/inspektor-gadget/releases/download/v${IG_VERSION}/ig-linux-amd64-v${IG_VERSION}.tar.gz" \
     && echo "${IG_SHA256}  /tmp/ig.tar.gz" | sha256sum -c - \
     && tar -xzf /tmp/ig.tar.gz -C /usr/local/bin ig \
