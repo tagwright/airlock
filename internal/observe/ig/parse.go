@@ -20,6 +20,15 @@ import (
 // (gadget.yaml) as of IG v0.55.1: trace_tcp, trace_dns, trace_sni. See the
 // research brief this adapter was built against for field-by-field
 // sourcing.
+//
+// One field's real shape diverged from that research brief's best-effort
+// reconstruction and was corrected against a live v0.55.1 capture: see
+// flexNameserver's doc comment below. Every other field name, nesting, and
+// discriminator value checked against that same live capture (dst/src
+// endpoints, runtime.containerId/containerName, trace_tcp's "connect"
+// type, trace_dns's "addresses" comma-separated string, trace_sni's bare
+// "name") matched what this file already expected. See docs/TESTING.md for
+// the full comparison and the real captured lines it was checked against.
 
 // runtimeInfo is IG's common container-attribution enrichment block,
 // present on all three gadgets' events.
@@ -39,6 +48,14 @@ type endpoint struct {
 // published trace_dns schema does not pin down the on-the-wire JSON shape
 // of its "addresses" field beyond "resolved IP(s)", so this accepts both
 // rather than guessing wrong and dropping every DNS answer.
+//
+// Confirmed against a real v0.55.1 capture (see docs/TESTING.md): IG
+// actually renders "addresses" as a single comma-separated string (e.g.
+// "104.20.23.154,172.66.147.243"), never a JSON array, for every response
+// this adapter has observed live. The array branch is kept regardless,
+// both because the published schema does not rule it out for some other
+// answer shape and because accepting a second, unobserved-but-plausible
+// wire shape costs nothing.
 type flexStringList []string
 
 func (f *flexStringList) UnmarshalJSON(data []byte) error {
@@ -64,6 +81,37 @@ func (f *flexStringList) UnmarshalJSON(data []byte) error {
 		}
 	}
 	*f = out
+	return nil
+}
+
+// flexNameserver unmarshals trace_dns's "nameserver" field. A real v0.55.1
+// capture (see docs/TESTING.md) showed this is an OBJECT
+// ({"addr":"127.0.0.11","version":4}), not the bare "ip:port" or "ip"
+// string the published schema text ("the resolver being talked to") had
+// implied and this adapter was originally built against. That mismatch
+// was not cosmetic: encoding/json.Unmarshal returns a non-nil error when
+// a JSON object lands on a string-typed struct field, and parseDNSLine
+// treats any Unmarshal error as "drop this line" -- so every single
+// trace_dns response event was being silently discarded before this
+// fix, regardless of how well-formed the rest of the line was. This type
+// accepts the real object shape (extracting just Addr) and falls back to
+// a plain string for resilience against a future schema reverting to one,
+// rather than special-casing just the shape observed today.
+type flexNameserver string
+
+func (f *flexNameserver) UnmarshalJSON(data []byte) error {
+	var obj struct {
+		Addr string `json:"addr"`
+	}
+	if err := json.Unmarshal(data, &obj); err == nil {
+		*f = flexNameserver(obj.Addr)
+		return nil
+	}
+	var s string
+	if err := json.Unmarshal(data, &s); err != nil {
+		return err
+	}
+	*f = flexNameserver(s)
 	return nil
 }
 
@@ -135,7 +183,7 @@ type dnsMsg struct {
 	Timestamp  string         `json:"timestamp"`
 	QR         string         `json:"qr"`
 	Name       string         `json:"name"`
-	Nameserver string         `json:"nameserver"`
+	Nameserver flexNameserver `json:"nameserver"`
 	Addresses  flexStringList `json:"addresses"`
 	Runtime    runtimeInfo    `json:"runtime"`
 }
@@ -169,7 +217,7 @@ func parseDNSLine(line []byte) (observe.Event, bool) {
 		Timestamp:     parseTimestamp(m.Timestamp),
 		QName:         m.Name,
 		Answers:       answers,
-		Nameserver:    m.Nameserver,
+		Nameserver:    string(m.Nameserver),
 	}, true
 }
 
