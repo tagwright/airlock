@@ -199,3 +199,45 @@ func TestBuildRuntime_DefaultsToDocker(t *testing.T) {
 		t.Errorf("default runtime %T does not implement runtime.NetworkInspector", rt)
 	}
 }
+
+// TestObserveRuntimes_TracksAirlockRuntime pins the fix this integration
+// pass made: buildObserveBackend must scope ig's -r/--runtimes flag to
+// whichever single runtime AIRLOCK_RUNTIME actually selects, never a
+// multi-runtime hedge -- see observeRuntimes' and ig.DefaultRuntimes' doc
+// comments for the real, confirmed-against-a-live-ig-run failure this
+// fixes (ig fails its entire startup, emitting zero events forever, the
+// moment any listed runtime other than the live one has no socket).
+func TestObserveRuntimes_TracksAirlockRuntime(t *testing.T) {
+	cases := []struct {
+		envRuntime string
+		want       string
+	}{
+		{envRuntime: "", want: "docker"},
+		{envRuntime: "docker", want: "docker"},
+		{envRuntime: "podman", want: "podman"},
+		{envRuntime: "PODMAN", want: "podman"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.envRuntime, func(t *testing.T) {
+			t.Setenv("AIRLOCK_RUNTIME", tc.envRuntime)
+			cfg := newTestConfig(t)
+			if got := observeRuntimes(cfg); got != tc.want {
+				t.Errorf("observeRuntimes(AIRLOCK_RUNTIME=%q) = %q, want %q", tc.envRuntime, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestObserveRuntimes_ExplicitConfigWins proves an operator's explicit
+// airlock.yml observe.runtimes setting is never overridden by
+// AIRLOCK_RUNTIME's default derivation -- e.g. a deployment that
+// deliberately wants ig scoped to more than one runtime can still ask for
+// that.
+func TestObserveRuntimes_ExplicitConfigWins(t *testing.T) {
+	t.Setenv("AIRLOCK_RUNTIME", "podman")
+	cfg := newTestConfig(t)
+	cfg.Observe.Runtimes = "docker,podman"
+	if got := observeRuntimes(cfg); got != "docker,podman" {
+		t.Errorf("observeRuntimes with explicit config = %q, want docker,podman", got)
+	}
+}

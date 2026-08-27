@@ -216,6 +216,20 @@ func buildRuntime(cfg *config.Config) (runtime.Runtime, error) {
 	}
 }
 
+// resolvedRuntimeName mirrors buildRuntime's own AIRLOCK_RUNTIME switch,
+// normalized to exactly the name ig's -r/--runtimes flag wants for that
+// same runtime ("docker" or "podman"), for buildObserveBackend to use.
+// It deliberately does not error on an unrecognized value the way
+// buildRuntime does -- buildRuntime is always called first and already
+// fails startup on that same input, so by the time this runs the value
+// (or its "" default) is known good.
+func resolvedRuntimeName() string {
+	if strings.ToLower(strings.TrimSpace(os.Getenv("AIRLOCK_RUNTIME"))) == "podman" {
+		return "podman"
+	}
+	return "docker"
+}
+
 // dockerSocket resolves the Docker API socket path: AIRLOCK_SOCKET if
 // set, otherwise DOCKER_HOST (with a "unix://" scheme prefix stripped,
 // since NewDocker wants a bare path), otherwise the conventional default.
@@ -252,9 +266,33 @@ func buildObserveBackend(cfg *config.Config) observe.Backend {
 	return ig.NewIGBackend(ig.Options{
 		IGPath:           cfg.Observe.IGPath,
 		Images:           cfg.Observe.Images,
-		Runtimes:         cfg.Observe.Runtimes,
+		Runtimes:         observeRuntimes(cfg),
 		DockerSocketPath: cfg.Observe.DockerSocketPath,
 	})
+}
+
+// observeRuntimes resolves ig run's -r/--runtimes value: cfg.Observe.Runtimes
+// verbatim when the operator set one explicitly in airlock.yml, otherwise
+// the single runtime name resolvedRuntimeName derives from AIRLOCK_RUNTIME
+// -- the same env var buildRuntime reads to pick airlock's own container
+// runtime.
+//
+// BUG FIX (this integration pass): this used to leave Runtimes empty
+// whenever airlock.yml left observe.runtimes unset, deferring entirely to
+// ig.Options' own DefaultRuntimes. That constant used to be ig's own
+// documented multi-runtime default (docker,containerd,cri-o,podman) --
+// see ig.DefaultRuntimes' doc comment for the real, confirmed-against-a-
+// live-ig-run failure mode that made that fatal on a plain-Docker-only
+// host. Even with that constant now fixed to a safe single "docker", this
+// function additionally makes the ig runtime scope track AIRLOCK_RUNTIME:
+// a fleet actually running Podman (AIRLOCK_RUNTIME=podman) needs ig scoped
+// to "podman", not the package default's "docker", or every gadget would
+// run against a runtime with no live containers to attribute anything to.
+func observeRuntimes(cfg *config.Config) string {
+	if cfg.Observe.Runtimes != "" {
+		return cfg.Observe.Runtimes
+	}
+	return resolvedRuntimeName()
 }
 
 // heartbeatInterval resolves the Gatus dead-man's-switch push cadence:

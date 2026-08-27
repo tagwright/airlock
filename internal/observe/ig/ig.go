@@ -58,8 +58,28 @@ const (
 	DefaultTraceDNSImage = "ghcr.io/inspektor-gadget/gadget/trace_dns:latest"
 	DefaultTraceSNIImage = "ghcr.io/inspektor-gadget/gadget/trace_sni:latest"
 
-	// DefaultRuntimes matches the ig CLI's own default for -r/--runtimes.
-	DefaultRuntimes = "docker,containerd,cri-o,podman"
+	// DefaultRuntimes is the -r/--runtimes value used when neither
+	// Options.Runtimes nor a caller-supplied override names one.
+	//
+	// This is deliberately just "docker", NOT the ig CLI's own
+	// documented multi-runtime default ("docker,containerd,cri-o,podman")
+	// this constant originally mirrored. Confirmed against a real
+	// v0.55.1 `ig run` on a plain-Docker-only host (no containerd/cri-o/
+	// podman API socket present -- the exact target deployment this
+	// project is built for): ig does not skip a listed runtime whose
+	// socket is missing, it fails the ENTIRE invocation at startup
+	// ("pre-starting operator \"LocalManager\": container-collection
+	// isn't available") the moment any one of them, other than docker,
+	// has no live socket. Passing the old multi-runtime default meant
+	// every gadget subprocess this backend supervises would crash-loop
+	// forever, at construction time, before ever emitting a single
+	// event, on the documented turnkey single-runtime deployment --
+	// silent total observation loss, not a degraded mode. Callers
+	// running against Podman instead of Docker must pass "podman"
+	// explicitly via Options.Runtimes (see internal/daemon's
+	// buildObserveBackend, which does this from AIRLOCK_RUNTIME); ig
+	// has no default that is safe across an unknown mix of runtimes.
+	DefaultRuntimes = "docker"
 
 	defaultBackoffMin = 500 * time.Millisecond
 	defaultBackoffMax = 30 * time.Second
