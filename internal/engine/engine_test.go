@@ -114,6 +114,30 @@ func TestAllowedByExactDomainAfterDNS(t *testing.T) {
 	wantNoViolation(t, got)
 }
 
+// TestAllowedByExactDomainAfterDNSWithTrailingDot pins the integration-pass-2
+// bug fix: a real trace_dns capture's "name" field is the wire-format
+// QNAME, always trailing-dot-terminated for a fully-qualified name
+// ("example.com."), which policy.ParseEntry's isValidDomain rejects
+// outright -- no Domain entry a human writes ever carries one. Before the
+// fix, recordDNS cached ev.QName verbatim, so matchEntry's EqualFold
+// comparison against a dotless policy entry never matched, for ANY
+// domain-based allow or deny, once SNI became enrichment-only. Every
+// existing DNS-correlation test above uses a hand-written, dotless qname
+// fixture and could not have caught this; this test's qname is
+// deliberately trailing-dot-terminated to match what run-detect.sh's real
+// `ig` capture actually produces.
+func TestAllowedByExactDomainAfterDNSWithTrailingDot(t *testing.T) {
+	w := newFakeWorld()
+	w.policies["c1"] = testPolicy("svc", policy.External, policy.Alert, []string{"example.com:443"}, nil)
+	e := New(w)
+
+	now := time.Now()
+	ip := mustAddr("93.184.216.34")
+	wantNoViolation(t, e.Process(dnsEvent("c1", "example.com.", 300*time.Second, now, ip)))
+	got := e.Process(connEvent("c1", ip, 443, now.Add(time.Second)))
+	wantNoViolation(t, got)
+}
+
 func TestAllowedByWildcardDomain(t *testing.T) {
 	w := newFakeWorld()
 	w.policies["c1"] = testPolicy("svc", policy.External, policy.Alert, []string{"*.example.com:443"}, nil)
@@ -157,6 +181,16 @@ func TestWildcardDomainDoesNotMatchApex(t *testing.T) {
 // destination IP is absent from this container's DNS cache. It also
 // proves SNI is still carried through as enrichment on the resulting
 // Violation.
+//
+// Classification is ClassUnresolvedIP, not ClassNoMatch, since
+// integration pass 2: with no DNS answer for this IP, dnsOK is the only
+// input the no-match/unresolved-ip split trusts now (see engine.go's
+// evaluateConnection step (f) and package doc comment) -- an SNI record
+// present at evaluation time can only ever belong to a DIFFERENT, earlier
+// connection from this container in a real deployment (trace_sni's
+// ClientHello for THIS connection cannot have been sent yet), so it no
+// longer softens the severity label, even though it is still shown as
+// enrichment below.
 func TestFailClosedSNIOnlyDoesNotMatchAllow(t *testing.T) {
 	w := newFakeWorld()
 	w.policies["c1"] = testPolicy("svc", policy.External, policy.Alert, []string{"example.com:443"}, nil)
@@ -167,7 +201,7 @@ func TestFailClosedSNIOnlyDoesNotMatchAllow(t *testing.T) {
 	e.Process(sniEvent("c1", "example.com", now))
 	got := e.Process(connEvent("c1", ip, 443, now.Add(time.Second)))
 
-	v := wantOneViolation(t, got, ClassNoMatch)
+	v := wantOneViolation(t, got, ClassUnresolvedIP)
 	if v.SNIName != "example.com" {
 		t.Errorf("Violation.SNIName = %q, want the observed SNI carried through as enrichment", v.SNIName)
 	}

@@ -64,6 +64,22 @@
 // dependent to begin with, since they match ground-truth connection facts
 // (the destination address) or live World data, not a name.
 //
+// UPDATE (integration pass 2): the no-match/unresolved-ip CLASSIFICATION
+// of an already-produced default-deny-floor violation was, until this
+// pass, still allowed to consider sniOK -- reasoned as harmless because
+// classification never gates allow/deny. A live regression run proved
+// that reasoning wrong: trace_sni's ClientHello for a connection always
+// arrives strictly after that connection's own TCP handshake, which is
+// strictly after the very Connection event evaluateConnection reacts to
+// synchronously -- so an SNI record already in the store at that instant
+// can only ever belong to an earlier connection from the same container,
+// never the one being evaluated. That let one connection's real SNI
+// silently downgrade an unrelated, immediately-following bare-IP
+// connection from unresolved-ip (the frozen doc's named exfiltration
+// shape) to the less-alarming no-match. Classification is now fail-closed
+// on dnsOK alone, for the same reason dnsOK alone decides the match: see
+// evaluateConnection's step (f) for the full account.
+//
 // One consequence: deferring a verdict to wait for a same-container SNI
 // no longer has anything to accomplish (DNS precedes the connect, so
 // DNS-based name matching is already available at connect time), so
@@ -174,8 +190,33 @@ func (e *Engine) Forget(containerID string) {
 // recordDNS updates the answering container's DNS cache from ev. Answers
 // with no qname or no addresses carry nothing to correlate and are
 // ignored.
+//
+// BUG FIX (integration pass 2): a real trace_dns capture's "name" field is
+// the wire-format QNAME, which always carries a trailing "." for a
+// fully-qualified name (confirmed live: "example.com.", "www.wikipedia.org.").
+// policy.ParseEntry's isValidDomain rejects any domain with a trailing dot
+// (a trailing "." produces an empty final label), so no Domain/
+// DomainWildcard entry a human can actually write in airlock.yml or a
+// label ever carries one. Before this fix, dnsCache stored ev.QName
+// verbatim, so ctx.dnsName in match.go always carried the trailing dot
+// while every entry it was compared against never did -- strings.EqualFold
+// then never matched, for ANY domain-based allow or deny, ever. This was
+// invisible to every existing unit test (their qname fixtures are all
+// hand-written without a trailing dot) and, before the fail-closed-on-SNI
+// change, was masked entirely in practice: SNI (which never carries a
+// trailing dot) still won a match on disagreement, so a real deployment's
+// domain allow rules kept working by accident. Once SNI became
+// enrichment-only, DNS-cache correlation became the ONLY path a
+// Domain/DomainWildcard entry can match through, and this pass's
+// regression re-run of run-detect.sh caught it immediately: the
+// example.com connection, allowed by a real DNS answer and a real SNI
+// ClientHello, was misclassified no-match instead of producing zero
+// violations. Fixed by normalizing the qname once, here, at the single
+// write path into the cache -- strings.TrimSuffix(_, ".") for the single
+// trailing dot a wire-format FQDN carries, never more than one.
 func (e *Engine) recordDNS(ev observe.Event) {
-	if ev.QName == "" || len(ev.Answers) == 0 {
+	qname := strings.TrimSuffix(ev.QName, ".")
+	if qname == "" || len(ev.Answers) == 0 {
 		return
 	}
 	ttl := ev.TTL
@@ -190,7 +231,7 @@ func (e *Engine) recordDNS(ev observe.Event) {
 		e.dns[ev.ContainerID] = c
 	}
 	for _, a := range ev.Answers {
-		c.put(a.Unmap(), ev.QName, expiry)
+		c.put(a.Unmap(), qname, expiry)
 	}
 }
 
@@ -336,13 +377,39 @@ func (e *Engine) evaluateConnection(ev observe.Event) *Violation {
 	// (f) Default-deny floor. The no-match/unresolved-ip split is a
 	// classification of an ALREADY-produced violation, not a match
 	// decision -- it never determines whether this connection is
-	// permitted, only how alarming the resulting alert reads -- so it may
-	// still consider SNI evidence: a connection with SOME name evidence
-	// (DNS or SNI) gives a human something to investigate and is
-	// classified no-match, while a bare IP with neither is the frozen
-	// doc's named exfiltration shape, unresolved-ip.
+	// permitted, only how alarming the resulting alert reads.
+	//
+	// BUG FIX (integration pass 2): this split is now fail-closed on
+	// dnsOK alone, the same direction as the matching fix above and for
+	// the identical structural reason. sniOK/sniName at THIS call site
+	// can never legitimately describe the connection currently being
+	// evaluated: trace_sni's ClientHello for a connection is only ever
+	// sent after that connection's own TCP handshake completes, which is
+	// strictly after the very Connection event this function is
+	// synchronously reacting to right now -- so any record already
+	// sitting in the SNI store at this instant was necessarily produced
+	// by an EARLIER connection from this same container, not this one.
+	// A live, back-to-back-connections regression run (see
+	// docs/TESTING.md) reproduced the consequence concretely: a bare-IP
+	// connection with zero name evidence of its own was silently
+	// downgraded from unresolved-ip (the frozen doc's named exfiltration
+	// shape) to the less-alarming no-match, because the immediately
+	// preceding connection's real SNI observation -- recorded a moment
+	// after that PRIOR connection had already been evaluated and
+	// returned, so nothing had consumed it yet -- was still sitting in
+	// the store when this unrelated connection asked. sniStore's
+	// consume-on-lookup fix (sni.go) bounds a record to at most one use,
+	// but cannot fix this specific case: the record's true owner never
+	// looked it up at all, because it hadn't been recorded yet at the
+	// time that owner was evaluated. dnsOK has no such structural
+	// timing hole (DNS precedes the connect it will be used for, always
+	// available at evaluation time), so it alone decides severity here.
+	// sniName is still carried through on the Violation/ObservedDest
+	// below purely as human-facing display -- unaffected by this fix,
+	// still exactly as racy and enrichment-only as the package doc
+	// comment already describes.
 	class := ClassNoMatch
-	if !dnsOK && !sniOK {
+	if !dnsOK {
 		class = ClassUnresolvedIP
 	}
 	e.recordObserved(ev.ContainerID, ev.ContainerName, dst, ev.DstPort, ev.Proto, dnsName, sniName, ev.Timestamp, class.String())

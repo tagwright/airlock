@@ -52,8 +52,29 @@ func (s *sniStore) record(name string, at time.Time) {
 }
 
 // lookup returns the SNI name temporally closest to now, if any recorded
-// name falls within sniWindow of it. Ties (equal distance) favor the
-// most recently recorded observation.
+// name falls within sniWindow of it, and CONSUMES that record (removes it
+// from s.recent) so it can never be returned to a second, later lookup.
+// Ties (equal distance) favor the most recently recorded observation.
+//
+// BUG FIX (integration pass 2): consuming on lookup closes a residual
+// misattribution risk from the same root cause docs/TESTING.md's
+// "RESOLVED: SNI correlation could misattribute across close-together
+// connections" section already fixed for MATCHING (fail-closed on SNI
+// removed it from matchEntry entirely) but not for the no-match/
+// unresolved-ip CLASSIFICATION step in engine.go's evaluateConnection,
+// which still reads sniOK from this same store purely to decide how
+// alarming a default-deny-floor violation reads. Confirmed live by this
+// pass's regression re-run of run-detect.sh, fired with no deliberate
+// spacing between connections (the 8s workaround this suite used to
+// dodge exactly this class of bug is gone): the example.com connection's
+// real SNI observation was still the temporally-closest entry in the
+// store when the VERY NEXT connection (the bare-IP 1.1.1.1 one, which
+// sends no SNI at all) was evaluated moments later -- misattributing
+// someone else's SNI to it and silently downgrading it from
+// unresolved-ip (the frozen doc's named exfiltration shape) to the
+// less-alarming no-match. Non-destructive lookup let the SAME
+// observation satisfy an unbounded number of later connections within
+// its window; consuming it bounds that to exactly one.
 func (s *sniStore) lookup(now time.Time) (string, bool) {
 	s.prune(now)
 	best := -1
@@ -74,7 +95,9 @@ func (s *sniStore) lookup(now time.Time) (string, bool) {
 	if best < 0 {
 		return "", false
 	}
-	return s.recent[best].name, true
+	name := s.recent[best].name
+	s.recent = append(s.recent[:best], s.recent[best+1:]...)
+	return name, true
 }
 
 // prune drops every observation more than sniWindow away from now in
