@@ -1,0 +1,46 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+name: CI
+
+# NOTE: per-repo CI cannot fetch github.com/tagwright/core until core is
+# PUBLISHED and TAGGED (airlock requires v0.3.0). airlock's go.mod carries
+# `replace github.com/tagwright/core => ../core`, and that sibling tree does
+# not exist in a lone checkout of this repo, so the module resolution below
+# is EXPECTED TO FAIL on the core fetch until then. This is the same
+# blocker bilgeline had with core before core was published, and ballast had
+# with beacon before beacon was published. Until core ships, the
+# authoritative build is the local/parent-context one (see the Dockerfile
+# header). This workflow is written correctly for the post-publish world:
+# once core is a real published module, drop the `replace` from go.mod and
+# this runs green as is.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      # Fetch tagwright's own modules (beacon, and core once published)
+      # directly from source rather than through the public proxy. go.sum
+      # still verifies.
+      GOPRIVATE: github.com/tagwright/*
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test ./...

@@ -1,0 +1,94 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+name: Release
+
+# Publishes ghcr.io/tagwright/airlock on a v* tag.
+#
+# RELEASE TRIGGER: push an annotated git tag of the form v<VERSION>, e.g.
+# `git tag v00.01.00b1 && git push origin v00.01.00b1`. The image tag is that
+# git tag with the leading `v` stripped, so v00.01.00b1 publishes
+# ghcr.io/tagwright/airlock:00.01.00b1 (plus :latest). That matches the
+# binary version baked from the VERSION file, so image tag and `airlock
+# version` agree exactly.
+#
+# Note on tag format: the suite uses a zero-padded beta convention
+# (00.01.00b1), which is NOT valid semver, so docker/metadata-action's
+# type=semver would silently drop it and publish only :latest. We derive the
+# tag from the ref with a leading-`v` strip instead of type=semver, so the
+# padded/beta form survives. Same reasoning bilgeline and ballast use.
+#
+# GOTCHAS, read before the first real release:
+#
+#  1. core must be published. The image build below uses `context: .` (a
+#     lone checkout of this repo), which works only once
+#     github.com/tagwright/core is a published module (airlock requires
+#     v0.3.0) and the Dockerfile has been simplified to a single-context
+#     build (drop the `replace` in go.mod and the core COPY, per the
+#     Dockerfile's own header comment). Until then the Dockerfile needs a
+#     parent context holding both core/ and airlock/, which this workflow
+#     does NOT provide, so this build fails on the core fetch exactly like
+#     CI does. Same blocker bilgeline had with core, and ballast had with
+#     beacon, before each was published.
+#
+#  2. ghcr package visibility. The first publish creates the ghcr package as
+#     PRIVATE. Flip it to public ONCE, by hand, in the package settings on
+#     GitHub after that first push. Later pushes keep whatever visibility
+#     you set.
+#
+#  3. tag vs VERSION. The image tag here comes from the git tag (leading `v`
+#     stripped), but the binary's own --version comes from the VERSION file
+#     baked in at build time (main.version). They must agree: before cutting
+#     a real release, make sure the VERSION file matches the tag you are
+#     about to push (bump VERSION, commit, then tag). A tag that disagrees
+#     with VERSION ships an image whose `airlock version` lies about which
+#     build it is.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Strip the leading `v` from the git tag (v00.01.00b1 -> 00.01.00b1)
+      # so the image tag matches the VERSION-derived binary version.
+      # type=semver is not used because the zero-padded beta tag is not
+      # valid semver.
+      - name: Derive image tag from git tag
+        id: ver
+        run: echo "tag=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Derive image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/tagwright/airlock
+          tags: |
+            type=raw,value=${{ steps.ver.outputs.tag }}
+            type=raw,value=latest
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
