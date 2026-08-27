@@ -1,0 +1,91 @@
+# Example airlock.yml. Every section is optional, and a missing or empty
+# file is valid: the surviving AIRLOCK_* environment variables overlay onto
+# it (env wins over the file), so env-only operation works too. This file
+# never carries a literal secret. It has no secret-shaped field at all --
+# see internal/config's package doc.
+
+# Fleet-wide tunables. Each one mirrors an AIRLOCK_* environment variable,
+# and the env var wins whenever both are set. Values shown here are the
+# built-in defaults, spelled out for reference, not because they need
+# restating in a real file.
+defaults:
+  # Observation scope: "all" watches every container's egress regardless of
+  # arming, "enabled" watches only armed containers. AIRLOCK_OBSERVE.
+  observe: all
+
+  # airlock.mode / groups[].mode fall back to this when unset. "block" is
+  # reserved and always a validation error in v1, never valid here either.
+  # AIRLOCK_DEFAULT_MODE.
+  default_mode: alert
+
+  # airlock.scope / groups[].scope fall back to this when unset.
+  # AIRLOCK_DEFAULT_SCOPE.
+  default_scope: external
+
+  # Dedup window per alert identity (service, destination, port, class),
+  # the fallback when a container or group leaves alert.window unset.
+  # AIRLOCK_ALERT_WINDOW.
+  alert_window: 1h
+
+  # Distinct-identity alerts per container per hour before the flood
+  # breaker collapses that container to one "flooding" summary.
+  # AIRLOCK_ALERT_FLOOD.
+  alert_flood: 30
+
+  # Plain cron for the one digest per period. AIRLOCK_DIGEST_SCHEDULE.
+  digest_schedule: "0 0 * * *"
+
+  # Extends the fixed resolver-on-port-53 baseline with more always-allowed
+  # destinations, or set to "none" to disable even the baseline for a
+  # hardened fleet. Left empty here: the baseline alone covers this fleet.
+  # AIRLOCK_IMPLICIT_ALLOW.
+  implicit_allow: []
+
+  # Opt in to the first-seen-destination-per-day digest for containers with
+  # no declared policy at all. Digest only, never immediate alerts, since
+  # without a declaration there is no deviation to alert on, only
+  # inventory. AIRLOCK_UNPOLICIED_DIGEST.
+  unpolicied_digest: false
+
+# Named, reusable policy sets (Fork 5). A container's airlock.policy label,
+# or a group's own policy field below, references one or more of these by
+# name as a csv. Lists union across every referenced set plus whatever the
+# referencing container or group declares itself.
+policies:
+  debian-updates:
+    allow:
+      - "deb.debian.org:443"
+      - "security.debian.org:443"
+
+  github-api:
+    allow:
+      - "api.github.com:443"
+      - "*.githubusercontent.com:443"
+
+# Group-scoped policy (Fork 8): applies a policy to a whole class of
+# containers automatically, on every discovery pass, with no per-container
+# label required at all. A group arms every container it matches.
+groups:
+  # A compose-project group: the whole media stack shares one policy with
+  # no label anywhere in its compose file. scope: all is what makes @self
+  # meaningful, letting the stack's containers reach each other freely
+  # while still declaring default-deny toward everything else.
+  - name: media-stack
+    match:
+      compose_project: mediastack
+    enable: "true"
+    scope: "all"
+    allow:
+      - "@self"
+      - "api.themoviedb.org:443"
+      - "*.servarr.com:443"
+
+  # A network-boundary group: every container on this network reaches
+  # nothing outbound, ever, declared once at the network instead of once
+  # per database. New containers added to the network later are covered
+  # automatically, with no policy to remember to copy.
+  - name: backend-db-net
+    match:
+      network: mediastack_backend
+    enable: "true"
+    allow: "none"
