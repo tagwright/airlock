@@ -3,6 +3,7 @@ module github.com/tagwright/airlock
 go 1.25.0
 
 require (
+	github.com/robfig/cron/v3 v3.0.1
 	github.com/tagwright/beacon v0.1.0
 	github.com/tagwright/core v0.3.0
 	gopkg.in/yaml.v3 v3.0.1
