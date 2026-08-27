@@ -1,0 +1,119 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Turnkey airlock stack: one privileged container. airlock drives Inspektor
+# Gadget (ig) as a subprocess of its own process, so there is no ig sidecar
+# to wire up -- everything below is what the ONE container needs.
+#
+# To use this file:
+#
+#   1. Copy docker-compose.yml, airlock.example.yml, and airlock.env.example
+#      to your deploy directory.
+#   2. Copy airlock.example.yml to airlock.yml and edit it: policies, groups,
+#      defaults, notification channels, telemetry. See the file itself and
+#      docs/DEPLOY.md.
+#   3. Provision secrets. Either (or both, they resolve in this order):
+#        - one file per secret name under ./secrets/ (bind-mounted below),
+#          the recommended path -- see docs/DEPLOY.md's SOPS recipe.
+#        - copy airlock.env.example to airlock.env and fill in
+#          AIRLOCK_SECRET_<NAME> values (the resolver's env fallback).
+#      Both are optional: the stack boots with neither, a channel whose
+#      secret is unresolved simply fails to send until you provide it.
+#   4. docker compose up -d
+#
+# docs/DEPLOY.md covers the PRIVILEGE TRADE-OFF this stack accepts in full:
+# read that before deploying to anything you care about.
+
+name: airlock
+
+services:
+  airlock:
+    image: ghcr.io/tagwright/airlock:latest
+    command: ["daemon"]
+
+    # ---------------------------------------------------------------------
+    # Privilege. airlock execs `ig` in-process to load eBPF tracers, and
+    # Inspektor Gadget has not (as of the pinned v0.55.1) invested in a
+    # fine-grained capability set for non-Kubernetes use: every documented
+    # deployment example uses --privileged, not an enumerated capability
+    # list. See docs/DEPLOY.md for exactly why each of the four privilege
+    # grants below is here and what breaks without it.
+    # ---------------------------------------------------------------------
+    privileged: true
+    pid: host
+
+    volumes:
+      # The container socket, READ-ONLY: tagwright/core's own container
+      # listing/inspection (airlock's attribution join) and ig's own
+      # container-collection enrichment both only ever read it, never
+      # create/stop/signal a container through it. /var/run is a symlink to
+      # /run on most Linux distros, so this also satisfies ig's own
+      # --docker-socketpath default of /run/docker.sock with no extra flag.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+
+      # The whole host filesystem, READ-ONLY, at /host: this is what lets ig
+      # enrich an eBPF event with the container runtime's own rootfs/
+      # config.json, and it is where the host's REAL /etc/resolv.conf ends
+      # up reachable (at /host/etc/resolv.conf -- see the AIRLOCK_RESOLV_CONF
+      # environment entry below, which points there instead of at this
+      # container's own Docker-embedded-DNS resolv.conf). Read-only because
+      # nothing airlock or ig do here ever needs to write to the host.
+      - /:/host:ro
+
+      # airlock's own config. Optional -- airlock runs env-only with no file
+      # at all -- but this is where you declare policies, groups, defaults,
+      # notification channels, and telemetry sinks.
+      - ./airlock.yml:/etc/airlock/airlock.yml:ro
+
+      # File-based secrets: one file per secret NAME, named after it (e.g.
+      # ./secrets/ntfy-airlock-token), read by internal/secret's resolver
+      # before it falls back to an AIRLOCK_SECRET_<NAME> env var. Read-only:
+      # airlock only ever reads a secret, never writes one. Provision this
+      # directory at deploy time (SOPS recipe in docs/DEPLOY.md); an empty
+      # or absent ./secrets directory is fine, it just means every secret
+      # falls through to its env-var form or fails to resolve until set.
+      - ./secrets:/run/airlock/secrets:ro
+
+    # ig's local gadget-image store (pulled OCI images, its own image cache
+    # and auth config under /var/lib/ig). A named volume here means a
+    # restarted or recreated container reuses already-pulled gadget images
+    # instead of re-pulling trace_tcp/trace_dns/trace_sni from ghcr.io every
+    # time. Gadget images are otherwise pulled lazily on first use (ig run's
+    # own default --pull=missing), not pre-pulled at build or container
+    # start -- see docs/DEPLOY.md's "gadget image pull behavior" section.
+      - ig-store:/var/lib/ig
+
+    tmpfs:
+      # The state-snapshot file (internal/daemon/state.go) `airlock status`
+      # and `airlock suggest` read. A plain tmpfs is enough: it is a
+      # debugging aid the daemon rewrites every AIRLOCK_STATE_INTERVAL (5s
+      # default), never something that needs to survive a restart. Kept at
+      # its own path (AIRLOCK_STATE_PATH below), distinct from the secrets
+      # bind mount above, so the two writable/read-only concerns never share
+      # a mount point.
+      - /run/airlock/state:mode=0755
+
+    environment:
+      # The host's real resolver configuration, reached through the /:/host
+      # mount above rather than this container's own Docker-embedded-DNS
+      # /etc/resolv.conf. See internal/daemon/resolv.go's own doc comment:
+      # this is a best-effort input to the fixed "resolver on port 53" allow
+      # baseline, and it only does anything for a host-network container in
+      # your fleet whose resolution actually goes through this file.
+      AIRLOCK_RESOLV_CONF: /host/etc/resolv.conf
+
+      # Matches the tmpfs mount point above; keeps the state file off the
+      # ./secrets bind mount's path entirely.
+      AIRLOCK_STATE_PATH: /run/airlock/state/state.json
+
+    # Beacon channel and other AIRLOCK_* secrets, as AIRLOCK_SECRET_<NAME>
+    # (or any other AIRLOCK_* env override you'd rather set this way than in
+    # airlock.yml). Optional: the stack boots fine with no airlock.env at
+    # all. See airlock.env.example and docs/DEPLOY.md.
+    env_file:
+      - path: ./airlock.env
+        required: false
+
+    restart: unless-stopped
+
+volumes:
+  ig-store:
