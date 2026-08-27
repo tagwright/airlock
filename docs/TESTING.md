@@ -25,7 +25,7 @@ Three layers, in increasing order of how much they actually prove:
    delivery. Every object these scripts create is named
    `airlock-itest-*` (or tagged `airlock-itest:latest`), never touches
    anything else on the host, and is torn down in a trap on exit
-   (success, failure, or interrupt). Two scripts today:
+   (success, failure, or interrupt). Three scripts today:
 
    - `run-capture.sh` -- the environment probe plus a real NDJSON capture
      of trace_tcp/trace_dns/trace_sni against a throwaway target
@@ -37,9 +37,19 @@ Three layers, in increasing order of how much they actually prove:
      from the real `Dockerfile`, runs it `--privileged` against the real
      Docker socket with no `--containername` scoping (the real,
      fleet-wide invocation airlock always issues), labels a target
-     container with a real policy, drives three real, deliberately
-     spaced connections through it, and asserts the resulting
-     `state.json` violation tally and a real ntfy delivery.
+     container with a real policy, drives three real connections fired
+     back to back (no deliberate spacing -- see "RESOLVED" below for why
+     that's safe now), and asserts the resulting `state.json` violation
+     tally and a real ntfy delivery.
+   - `run-groups.sh` (pass 2) -- everything `run-detect.sh` does not
+     exercise: a real `deny` rule beating `allow: "*"`, a Fork 8 group
+     arming two containers with NO `airlock.*` label at all (matched by
+     Docker network), `@self` under `scope: all` resolved against REAL
+     core network data (core's `ListNetworks`/`Container.Networks`, not
+     unit-test fakes) permitting a container-to-container connection
+     while an external one from the same container still violates, and
+     `mode: audit` tallying a violation without alerting on it
+     immediately. See "Pass 2" below.
 
 3. **Deliberately manual / needs Nate's resources.** A few things are
    exercised by hand or not at all here, listed under "What remains"
@@ -340,6 +350,92 @@ Covered by `internal/engine`'s unit tests
 `test/integration/run-detect.sh`'s connections now firing without the
 former spacing workaround.
 
+## Pass 2: groups, `@self`, `scope: all`, deny, and audit mode -- against real Docker network data
+
+Phase 5 pass 2's job was the group-scoped surface Fork 8 defines: things
+that had only ever been proven against `internal/resolve`'s and
+`internal/engine`'s own fake-`World`/fake-`Config` unit tests, never
+against a live `ig`, a live Docker daemon, or real `core.ListNetworks`/
+`Container.Networks` data. This pass also re-ran `run-detect.sh` as a
+regression guard, unchanged, immediately after the fail-closed-on-SNI
+change (`548fcd7`) landed -- and it did not pass on the first try.
+
+### Two more real bugs, found by the regression re-run
+
+Both were invisible to every existing unit test (their fixtures are all
+hand-written and never happened to hit either gap) and were only exposed
+because `run-detect.sh` fires its three connections back to back, with no
+deliberate spacing, specifically because fail-closed-on-SNI was supposed
+to have made that safe.
+
+1. **A real DNS answer's qname carries a trailing dot; no policy entry
+   ever can.** `internal/observe/ig`'s real trace_dns capture confirms
+   the `name` field is the wire-format QNAME, always trailing-dot
+   terminated for a fully-qualified name (`"example.com."`, not the
+   dotless `"example.com"`). `policy.ParseEntry`'s `isValidDomain`
+   rejects any domain ending in `.` outright (a trailing dot produces an
+   empty final label), so no `airlock.allow`/`airlock.deny` entry a human
+   writes can ever carry one. `recordDNS` cached the real qname verbatim,
+   so `matchEntry`'s `strings.EqualFold` comparison against a policy
+   entry's dotless domain never matched -- for **any** domain-based allow
+   or deny, once SNI could no longer win a match on disagreement. Before
+   fail-closed-on-SNI this was completely masked: SNI (which never
+   carries a trailing dot) kept winning by accident, so a real
+   deployment's domain rules worked anyway, for the wrong reason. Fixed
+   in `recordDNS` (`internal/engine/engine.go`), which now normalizes the
+   qname once at the cache's single write path. Confirmed live: the
+   `example.com` connection in `run-detect.sh`, previously misclassified
+   `no-match` after the fail-closed change landed, is now correctly
+   `allowed` with zero violations.
+
+2. **A stray SNI observation could still downgrade a violation's
+   severity label.** The no-match/unresolved-ip split was reasoned to be
+   safe to keep reading `sniOK` even after fail-closed-on-SNI, since it
+   only affects how alarming an alert reads, never the allow/deny
+   decision. A live run proved that reasoning wrong: `trace_sni`'s
+   ClientHello for a connection is only ever sent after that
+   connection's own TCP handshake completes, which is strictly *after*
+   the very `Connection` event `evaluateConnection` reacts to
+   synchronously -- so any SNI record already sitting in the store at
+   that instant can only belong to an **earlier** connection from the
+   same container, never the one currently being evaluated. Confirmed
+   live: a bare-IP connection with zero name evidence of its own
+   (`1.1.1.1`, fired moments after the `example.com` connection) was
+   classified `no-match` instead of `unresolved-ip` -- the frozen doc's
+   named exfiltration shape, silently softened -- because the
+   `example.com` connection's real SNI observation, recorded a moment
+   *after* that connection had already been evaluated and returned, was
+   still sitting unconsumed in the store when the unrelated `1.1.1.1`
+   connection asked. Fixed by making the classification fail-closed on
+   `dnsOK` alone, same direction as the matching fix (`internal/engine`'s
+   package doc comment and `evaluateConnection`'s step (f) have the full
+   account). `sniStore.lookup` also now consumes the record it returns,
+   closing a related but distinct reuse risk, though it was not the
+   cause of this specific bug -- the record's true owner never looked it
+   up at all, since it hadn't been recorded yet at that connection's own
+   evaluation time.
+
+Both fixed in the same commit as this pass, covered by
+`TestAllowedByExactDomainAfterDNSWithTrailingDot`,
+`TestFailClosedSNIOnlyDoesNotMatchAllow` (updated expected class), and
+`TestSNIStoreLookupConsumesRecord`. `run-detect.sh` passes end to end
+after both fixes, still firing all three connections back to back.
+
+### The four distinctive features: all proven live, on the first clean run
+
+With the regression fixed, `test/integration/run-groups.sh` proved every
+Fork 8 surface this pass targeted, all in one daemon/config/network
+setup, no further bugs found:
+
+| Feature | Proof | Confirmed |
+|---|---|---|
+| `deny` beats `allow: "*"` | `airlock-itest-denytarget`: `allow: "*"` + `deny: 1.1.1.1:443`. A connection to `1.1.1.1:443` produced `violations_by_class.deny == 1`; a connection to `example.com` (falling through to the `allow: "*"` denylist posture) produced zero additional violations. | Yes, plus a real ntfy delivery naming the container and `(deny)`. |
+| Group arms containers with NO `airlock.*` label | `airlock-itest-a` and `airlock-itest-b`, no labels at all, attached to `airlock-itest-groupnet`. `groups.itest.yml`'s `itest-groupnet` group (`match: {network: airlock-itest-groupnet}`, `enable: "true"`, `scope: "all"`, `allow: ["@self"]`) armed both: `state.json` lists both with `matched_groups: ["itest-groupnet"]` and `scope: "all"`, with no per-container label ever set. | Yes. |
+| `@self` + `scope: all` against **real** core network data | `a -> b` (both on `airlock-itest-groupnet`): `@self` resolved `b`'s IP as within the group members' own network subnet -- allowed, zero violations. `a -> 1.1.1.1` (external): `scope: all` brought it into scope, `@self` does not cover it -- `violations_by_class.unresolved-ip == 1` on `a`. This is core's network-introspection extension's (`f6cd8da`, `ListNetworks` + `Container.Networks`) **first live exercise**: every prior proof of `@self`/`scope`/group-matching was against `internal/resolve`'s and `internal/engine`'s fake `World`/`Config` fixtures only. | Yes, plus a real ntfy delivery for `a`'s `unresolved-ip` violation. |
+| `mode: audit` suppresses the immediate alert but still tallies | `airlock-itest-audittarget`: `airlock.mode=audit`, `airlock.allow=example.com:443`. A connection to `www.wikipedia.org` (not allow-listed) produced `violations_by_class.no-match == 1` in `state.json` -- tallied -- but no message naming `airlock-itest-audittarget` ever reached the real ntfy topic. | Yes. |
+
+No bug was found in `internal/resolve`'s group-matching, `internal/engine/scope.go`'s `selfSubnets`/`inOwnNetworks`, or the daemon's `world.go` wiring of `core.Network`/`ContainerNetwork` into the engine's `World` interface -- the exact surface flagged as highest-risk going into this pass (group matching + `@self` had only ever been unit-tested against fakes). All of it worked correctly against a real Docker bridge network, real container IPs, and a real `ig` on the first clean run after the regression fixes above landed.
+
 ## Coverage matrix
 
 | Capability / path | Status | Notes |
@@ -352,7 +448,7 @@ former spacing workaround.
 | SNI-based allow correlation | **Superseded, historical only** | At the time of this run SNI could win a match on disagreement with DNS; that path no longer exists (see "RESOLVED" above) -- SNI is enrichment-only now, and matching is DNS-cache correlation alone. |
 | `unresolved-ip` classification | **Integration-proven** | `1.1.1.1`: real bare-IP connection, no name evidence, correctly classified, tallied, alerted, and delivered to a real ntfy server. |
 | `no-match` classification | **Integration-proven** | `www.wikipedia.org`: real name evidence, not allow-listed, correctly classified, tallied, alerted, delivered. |
-| `deny` classification | **Not exercised this pass** | No deny rule in this pass's policy fixture; the class is well covered at the unit level (`engine_test.go`'s `TestDenyBeatsAllow` and others) but never driven by a real deny-matching connection here. Natural next `run-detect.sh` addition. |
+| `deny` classification | **Integration-proven (pass 2)** | `run-groups.sh`: `airlock-itest-denytarget`'s `deny: 1.1.1.1:443` beat its own `allow: "*"`, real connection, real tally, real ntfy delivery. |
 | Violation tallying (`state.json`) | **Integration-proven, and a real bug fixed** | See "A fourth real bug" above. The original bug was specific to the (now-removed) deferred/flush path; tallying is unit-tested end to end on the current synchronous path (`daemon_test.go`'s `TestRecordAndAlertViolation_Tallies`). |
 | Real alert delivery, log channel | **Integration-proven** | Every `run-detect.sh` run's daemon log. |
 | Real alert delivery, ntfy | **Integration-proven** | `run-detect.sh`'s ntfy assertion, via ntfy's own JSON poll API. |
@@ -360,24 +456,46 @@ former spacing workaround.
 | Gatus telemetry sink | **Not yet tested** | No itest configures `telemetry`; needs a real Gatus push-URL target. |
 | SNI correlation across close-together connections | **RESOLVED (fail-closed on SNI)** | See the dedicated section above. Nate ratified fail-closed on SNI as the fix; the deferral machinery this risk depended on is removed entirely. `run-detect.sh` now fires its three connections back to back rather than spaced, as part of the proof. |
 | Podman backend, IG-side | **Not yet tested** | This pass only exercised the Docker runtime end to end. `internal/daemon`'s `resolvedRuntimeName`/`observeRuntimes` fix is unit-tested (`TestObserveRuntimes_TracksAirlockRuntime`) for the `AIRLOCK_RUNTIME=podman` case, but no itest here stands up a real Podman socket the way `ballast`'s `run-podman.sh` does. |
-| Digest pinning (`Options.Images`) | **Not exercised** | Every capture/detect run in this pass used `:latest` gadget images (this pass's own default). Digest pinning is a packaging-time decision documented as a TODO in `internal/observe/ig`'s package doc; not itself a behavior this harness can meaningfully test differently. |
-| `groups`/`@self`/`scope`/flood/audit modes | **Out of scope for this pass** | Per the phase plan: later integration passes. |
+| Digest pinning (`Options.Images`) | **Not exercised** | Every capture/detect run in this and pass 2 used `:latest` gadget images (this suite's own default). Digest pinning is a packaging-time decision documented as a TODO in `internal/observe/ig`'s package doc; not itself a behavior this harness can meaningfully test differently. |
+| Group matching by network (Fork 8), no per-container label | **Integration-proven (pass 2)** | `run-groups.sh`: `airlock-itest-a`/`-b`, zero `airlock.*` labels, armed entirely by a `match: {network: ...}` group. `state.json`'s `matched_groups` confirms the match. |
+| `@self` under `scope: all`, against real core network data | **Integration-proven (pass 2)** | `run-groups.sh`: `a -> b` on the same group network allowed via `@self`; `a -> 1.1.1.1` (external) violated. First live exercise of core's `ListNetworks`/`Container.Networks` extension (`f6cd8da`) -- previously fake-`World`-only. |
+| `mode: audit` | **Integration-proven (pass 2)** | `run-groups.sh`: a real violation was tallied into `state.json` but never reached the real ntfy topic. |
+| `@project`, `net:<name>` tokens | **Unit-tested only** | `internal/engine`'s `TestProjectTokenMatchesPeerExactlyNotSubnet`/`TestNamedNetworkTokenAllows` cover these against fake `World` data; pass 2 only drove `@self` live. Natural next `run-groups.sh`-style addition. |
+| Alert flood breaker at scale | **Not yet tested** | `defaults.alert_flood`/the flood-breaker collapse-to-one-alert behavior is unit-tested in `internal/alert` but never driven by a real volume of live violations. |
+| Digest cron timing | **Not yet tested** | `defaults.digest_schedule` and the periodic digest fire are unit-tested (cron parsing, `runDigest`'s wiring) but never observed live across a real schedule boundary -- this harness's runs are too short-lived to wait for one. |
 
 ## What remains for later integration passes
 
-- **A real `deny` rule** driven end to end (currently only unit-tested).
-- **Podman**, end to end, the way this pass did Docker: a real Podman
+As of pass 2 (`run-detect.sh` regression-fixed, `run-groups.sh` added):
+`deny`, group-by-network arming, `@self` + `scope: all` against real core
+network data, and `mode: audit` are all integration-proven. Still open:
+
+- **Podman**, end to end, the way these passes did Docker: a real Podman
   socket, `AIRLOCK_RUNTIME=podman`, confirming `observeRuntimes` actually
   points `ig` at `-r podman` in a live run, not just in a unit test.
-- **Groups (Fork 8), `@self`/`@project`/`net:<name>` tokens, `scope:
-  all`, the alert flood breaker, and audit mode** -- explicitly deferred
-  to later passes per the phase plan, and each has real live-traffic
-  edge cases (e.g. does `@self` really resolve against real compose-
-  project peers on a real network) worth the same "run it for real"
-  treatment this pass gave the base pipeline.
-- **Digest-pinned gadget images** (`Options.Images`) -- this pass only
-  ever ran `:latest`.
+- **`@project` and `net:<name>` tokens**, live -- pass 2 only drove
+  `@self` against a real network; `@project` needs a real compose-project
+  pair of containers, `net:<name>` needs a second real named network to
+  resolve by name. Both are unit-tested against fake `World` data
+  already; a `run-groups.sh`-style addition is the natural next step,
+  same shape as the `@self` proof.
+- **The alert flood breaker at scale** -- `defaults.alert_flood`'s
+  collapse-to-one-alert behavior, driven by a real volume of live
+  violations rather than a unit test's synthetic count.
+- **Digest cron timing** -- observing a real `defaults.digest_schedule`
+  fire across an actual schedule boundary; this harness's runs are too
+  short-lived to wait for one honestly, so this needs either a
+  long-running itest or a schedule set to fire within the run window.
+- **Digest-pinned gadget images** (`Options.Images`) -- every itest run
+  so far, both passes, only ever ran `:latest`.
 - **Discord/SMTP/webhook notification delivery and the Gatus telemetry
   sink** -- need a live external endpoint or account this repo-local
   harness doesn't have, mirroring the identical boundary ballast's own
   `TESTING.md` documents for its notification backends.
+- **Group-vs-label specificity conflicts, live** -- `internal/resolve`'s
+  specificity-ladder tiering (label beats identity-group beats
+  network-group beats catch-all, same-tier conflict is a sticky error) is
+  thoroughly unit-tested, but no itest here has yet driven a real
+  container where a label AND a matching group disagree on the same
+  scalar, to confirm the resolved winner end to end against a live
+  daemon reconcile rather than a direct `resolve.Resolve` call.

@@ -1,0 +1,26 @@
+defaults:
+  alert_window: 1s
+  alert_flood: 1000
+
+notifications:
+  channels:
+    - type: ntfy
+      min_level: warn
+      settings:
+        server: http://airlock-itest-ntfy:80
+        topic: airlock-itest-p2
+
+# Fork 8 group: arms every container on airlock-itest-groupnet with NO
+# per-container airlock.* label at all. scope: all opts into
+# container-to-container judging, and allow: "@self" permits every peer on
+# that same network -- this is the live proof that group matching + @self
+# + scope=all resolve correctly against a REAL Docker network (core's
+# ListNetworks/Container.Networks), not just the unit-test fakes.
+groups:
+  - name: itest-groupnet
+    match:
+      network: airlock-itest-groupnet
+    enable: "true"
+    scope: "all"
+    allow:
+      - "@self"
