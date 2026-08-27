@@ -104,13 +104,13 @@ notifications:
       settings:
         topic: airlock-alerts
         # Secret name, resolved at runtime, not a literal ntfy access token.
-        token: ntfy-airlock-token
+        token_secret: ntfy-airlock-token
 
     - type: discord
       min_level: error
       settings:
         # Secret name naming a Discord webhook URL, not the URL itself.
-        webhook_url: discord-airlock-webhook
+        webhook_secret: discord-airlock-webhook
 
 # Health and status push sinks, separate from the alert channels above.
 # Report(ctx, healthy) pushes to these on the daemon's own heartbeat
