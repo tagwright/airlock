@@ -1,0 +1,41 @@
+defaults:
+  alert_window: 1s
+  # Deliberately small so the flood breaker's collapse-to-one-alert
+  # behavior triggers on a handful of distinct destinations instead of
+  # needing 30+ -- see run-pass3.sh's flood test comment.
+  alert_flood: 5
+
+notifications:
+  channels:
+    - type: ntfy
+      min_level: warn
+      settings:
+        server: http://airlock-itest-ntfy:80
+        topic: airlock-itest-p3
+
+# itest-project: arms EVERY container sharing the compose_project
+# "airlock-itest-proj" with NO per-container airlock.* label at all --
+# proves @project resolves against core's real ProjectPeerIPs index
+# (internal/daemon/world.go), built from real container IPs grouped by
+# com.docker.compose.project, not the internal/engine fake-World fixtures
+# that are all @project has ever been tested against before this pass.
+groups:
+  - name: itest-project
+    match:
+      compose_project: airlock-itest-proj
+    enable: "true"
+    scope: "all"
+    allow:
+      - "@project"
+
+  # itest-neta: arms every container on airlock-itest-neta with
+  # allow: net:airlock-itest-netb -- proves net:<name> resolves a NAMED
+  # Docker network's subnet from core's real ListNetworks, independent of
+  # whether the connecting container is itself attached to that network.
+  - name: itest-neta
+    match:
+      network: airlock-itest-neta
+    enable: "true"
+    scope: "all"
+    allow:
+      - "net:airlock-itest-netb"

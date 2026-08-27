@@ -25,7 +25,7 @@ Three layers, in increasing order of how much they actually prove:
    delivery. Every object these scripts create is named
    `airlock-itest-*` (or tagged `airlock-itest:latest`), never touches
    anything else on the host, and is torn down in a trap on exit
-   (success, failure, or interrupt). Three scripts today:
+   (success, failure, or interrupt). Four scripts today:
 
    - `run-capture.sh` -- the environment probe plus a real NDJSON capture
      of trace_tcp/trace_dns/trace_sni against a throwaway target
@@ -50,6 +50,15 @@ Three layers, in increasing order of how much they actually prove:
      while an external one from the same container still violates, and
      `mode: audit` tallying a violation without alerting on it
      immediately. See "Pass 2" below.
+   - `run-pass3.sh` (pass 3) -- the two remaining group tokens and the
+     alert flood breaker, still against real Docker/core data and a real
+     `ig`: `@project` resolved from a real compose-project pair of
+     containers (`internal/daemon/world.go`'s `ProjectPeerIPs`), `net:<name>`
+     resolved from a second, entirely separate real named network
+     (`internal/engine/match.go`'s `namedNetworkContains` walking core's
+     real `ListNetworks`), and `internal/alert`'s flood breaker collapsing
+     a real burst of distinct-destination violations into one "flooding"
+     alert. See "Pass 3" below.
 
 3. **Deliberately manual / needs Nate's resources.** A few things are
    exercised by hand or not at all here, listed under "What remains"
@@ -436,6 +445,31 @@ setup, no further bugs found:
 
 No bug was found in `internal/resolve`'s group-matching, `internal/engine/scope.go`'s `selfSubnets`/`inOwnNetworks`, or the daemon's `world.go` wiring of `core.Network`/`ContainerNetwork` into the engine's `World` interface -- the exact surface flagged as highest-risk going into this pass (group matching + `@self` had only ever been unit-tested against fakes). All of it worked correctly against a real Docker bridge network, real container IPs, and a real `ig` on the first clean run after the regression fixes above landed.
 
+## Pass 3: `@project`, `net:<name>`, and the alert flood breaker at scale
+
+Phase 5 pass 3's job was the last group-token surface pass 2 did not drive
+live (`@self` was pass 2's only live token proof) plus the alert flood
+breaker, which had only ever been exercised with `alert_test.go`'s
+synthetic, time-injected counts. `test/integration/run-pass3.sh` builds
+the real image, runs the real daemon `--privileged` against the real
+Docker socket with a real `ig`, and proves all three in one
+daemon/config/network setup:
+
+| Feature | Proof | Confirmed |
+|---|---|---|
+| `@project` against **real** `ProjectPeerIPs` | `airlock-itest-pa` and `airlock-itest-pb`, both labeled `com.docker.compose.project=airlock-itest-proj`, no other `airlock.*` label, armed by `pass3.itest.yml`'s `compose_project`-matched group (`allow: "@project"`, `scope: all`). `pa -> pb` (same project, different container) produced zero violations; `pa -> 1.1.1.1` (external) produced `violations_by_class.unresolved-ip == 1`. This is `internal/daemon/world.go`'s `ProjectPeerIPs` index's first live exercise -- built by walking every real container's real IPs grouped by compose project, distinct code from `@self`'s `selfSubnets` path pass 2 already proved. | Yes, plus a real ntfy delivery naming `airlock-itest-pa`. |
+| `net:<name>` against **real** `ListNetworks` | `airlock-itest-neta-c` (on `airlock-itest-neta`, armed by a network-matched group with `allow: "net:airlock-itest-netb"`, `scope: all`) and `airlock-itest-netb-t` (on the entirely separate `airlock-itest-netb`, no policy of its own). `neta-c -> netb-t` (a real IP on a network `neta-c` is not itself attached to) produced zero violations; `neta-c -> 1.1.1.1` (external) produced `violations_by_class.unresolved-ip == 1`. Proves `internal/engine/match.go`'s `namedNetworkContains` resolves a named network's subnet by walking core's real `ListNetworks` inventory, independent of the connecting container's own attachments -- the thing `@self` deliberately does NOT cover. | Yes, plus a real ntfy delivery naming `airlock-itest-neta-c`. |
+| Alert flood breaker at real scale | `airlock-itest-flood`, bare `airlock.enable=true` (default-deny), fired at 15 distinct real external IPs in parallel. `pass3.itest.yml` lowers `alert_flood` to 5 for a fast, small proof. `state.json` tallied all 15 as `unresolved-ip` (tallying is unconditional, independent of the flood breaker). The real ntfy topic received exactly 5 individual per-destination alerts (identities 1-5, under the cap) followed by exactly ONE `"airlock: airlock-itest-flood (...) flooding"` alert (identity 6 crossing the cap) -- identities 7-15 produced zero further messages, confirmed by counting `event: message` lines naming the container in the real ntfy JSON poll response. | Yes, run twice for determinism; both runs produced exactly 6 total messages (5 + 1) and exactly 1 "flooding" title, never 15 separate alerts. |
+
+No bug was found in `internal/daemon/world.go`'s `ProjectPeerIPs`,
+`internal/engine/match.go`'s `namedNetworkContains`, or
+`internal/alert`'s `countFlood`/`sendFlood` -- the exact surfaces flagged
+as highest-risk going into this pass (both tokens and the flood breaker
+had only ever been exercised against fakes or synthetic counts). All of
+it worked correctly against real Docker networks, a real compose-project
+label pair, and a real `ig`, on the first clean run, reproduced on a
+second run with identical results.
+
 ## Coverage matrix
 
 | Capability / path | Status | Notes |
@@ -460,34 +494,28 @@ No bug was found in `internal/resolve`'s group-matching, `internal/engine/scope.
 | Group matching by network (Fork 8), no per-container label | **Integration-proven (pass 2)** | `run-groups.sh`: `airlock-itest-a`/`-b`, zero `airlock.*` labels, armed entirely by a `match: {network: ...}` group. `state.json`'s `matched_groups` confirms the match. |
 | `@self` under `scope: all`, against real core network data | **Integration-proven (pass 2)** | `run-groups.sh`: `a -> b` on the same group network allowed via `@self`; `a -> 1.1.1.1` (external) violated. First live exercise of core's `ListNetworks`/`Container.Networks` extension (`f6cd8da`) -- previously fake-`World`-only. |
 | `mode: audit` | **Integration-proven (pass 2)** | `run-groups.sh`: a real violation was tallied into `state.json` but never reached the real ntfy topic. |
-| `@project`, `net:<name>` tokens | **Unit-tested only** | `internal/engine`'s `TestProjectTokenMatchesPeerExactlyNotSubnet`/`TestNamedNetworkTokenAllows` cover these against fake `World` data; pass 2 only drove `@self` live. Natural next `run-groups.sh`-style addition. |
-| Alert flood breaker at scale | **Not yet tested** | `defaults.alert_flood`/the flood-breaker collapse-to-one-alert behavior is unit-tested in `internal/alert` but never driven by a real volume of live violations. |
+| `@project` token | **Integration-proven (pass 3)** | `run-pass3.sh`: `pa -> pb` (same `com.docker.compose.project`) allowed via `@project`; `pa -> 1.1.1.1` (external) violated. First live exercise of `internal/daemon/world.go`'s `ProjectPeerIPs` index. |
+| `net:<name>` token | **Integration-proven (pass 3)** | `run-pass3.sh`: `neta-c -> netb-t` (a real IP on a *different* named network, resolved by name) allowed via `net:airlock-itest-netb`; `neta-c -> 1.1.1.1` (external) violated. First live exercise of `internal/engine/match.go`'s `namedNetworkContains` against real `core.ListNetworks` data. |
+| Alert flood breaker at scale | **Integration-proven (pass 3)** | `run-pass3.sh`: 15 distinct real external destinations against a lowered `alert_flood: 5` cap collapsed to 5 individual alerts + exactly 1 "flooding" alert, confirmed via the real ntfy JSON poll response, run twice for determinism. |
 | Digest cron timing | **Not yet tested** | `defaults.digest_schedule` and the periodic digest fire are unit-tested (cron parsing, `runDigest`'s wiring) but never observed live across a real schedule boundary -- this harness's runs are too short-lived to wait for one. |
 
 ## What remains for later integration passes
 
-As of pass 2 (`run-detect.sh` regression-fixed, `run-groups.sh` added):
-`deny`, group-by-network arming, `@self` + `scope: all` against real core
-network data, and `mode: audit` are all integration-proven. Still open:
+As of pass 3 (`run-detect.sh`, `run-groups.sh`, `run-pass3.sh`): `deny`,
+group-by-network and group-by-compose_project arming, `@self`, `@project`,
+`net:<name>`, `scope: all` against real core network data, `mode: audit`,
+and the alert flood breaker at scale are all integration-proven. Still
+open:
 
 - **Podman**, end to end, the way these passes did Docker: a real Podman
   socket, `AIRLOCK_RUNTIME=podman`, confirming `observeRuntimes` actually
   points `ig` at `-r podman` in a live run, not just in a unit test.
-- **`@project` and `net:<name>` tokens**, live -- pass 2 only drove
-  `@self` against a real network; `@project` needs a real compose-project
-  pair of containers, `net:<name>` needs a second real named network to
-  resolve by name. Both are unit-tested against fake `World` data
-  already; a `run-groups.sh`-style addition is the natural next step,
-  same shape as the `@self` proof.
-- **The alert flood breaker at scale** -- `defaults.alert_flood`'s
-  collapse-to-one-alert behavior, driven by a real volume of live
-  violations rather than a unit test's synthetic count.
 - **Digest cron timing** -- observing a real `defaults.digest_schedule`
   fire across an actual schedule boundary; this harness's runs are too
   short-lived to wait for one honestly, so this needs either a
   long-running itest or a schedule set to fire within the run window.
 - **Digest-pinned gadget images** (`Options.Images`) -- every itest run
-  so far, both passes, only ever ran `:latest`.
+  so far, across all three passes, only ever ran `:latest`.
 - **Discord/SMTP/webhook notification delivery and the Gatus telemetry
   sink** -- need a live external endpoint or account this repo-local
   harness doesn't have, mirroring the identical boundary ballast's own
