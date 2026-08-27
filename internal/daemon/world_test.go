@@ -237,6 +237,49 @@ func TestParseResolvConf_MissingFile(t *testing.T) {
 	}
 }
 
+// TestResolvConfPath_HonorsEnvOverride covers the actual deployment
+// scenario the packaging chunk relies on: a host-network container's own
+// /etc/resolv.conf is Docker's embedded 127.0.0.11 stub, not the real LAN
+// resolver, so the daemon must read AIRLOCK_RESOLV_CONF (typically
+// pointed at a bind-mounted /host/etc/resolv.conf) instead when it is
+// set, and fall back to the conventional default when it is not.
+func TestResolvConfPath_HonorsEnvOverride(t *testing.T) {
+	dir := t.TempDir()
+	fixture := filepath.Join(dir, "host-resolv.conf")
+	if err := os.WriteFile(fixture, []byte("nameserver 203.0.113.53\n"), 0o600); err != nil {
+		t.Fatalf("write resolv.conf fixture: %v", err)
+	}
+
+	t.Setenv("AIRLOCK_RESOLV_CONF", fixture)
+	if got := resolvConfPath(); got != fixture {
+		t.Fatalf("resolvConfPath() = %q, want %q", got, fixture)
+	}
+	if got := parseResolvConf(resolvConfPath()); len(got) != 1 || got[0] != mustAddr(t, "203.0.113.53") {
+		t.Errorf("parseResolvConf(resolvConfPath()) = %v, want [203.0.113.53]", got)
+	}
+}
+
+// TestResolvConfPath_UnsetFallsBackToDefault covers the other half: with
+// AIRLOCK_RESOLV_CONF unset, resolvConfPath must fall back to
+// defaultResolvConfPath, and parsing a path that does not exist there (as
+// in a test sandbox with no real /etc/resolv.conf-shaped file at that
+// exact path) must degrade gracefully to an empty resolver set, never an
+// error.
+func TestResolvConfPath_UnsetFallsBackToDefault(t *testing.T) {
+	t.Setenv("AIRLOCK_RESOLV_CONF", "")
+	if got := resolvConfPath(); got != defaultResolvConfPath {
+		t.Fatalf("resolvConfPath() = %q, want default %q", got, defaultResolvConfPath)
+	}
+
+	// Exercise the graceful-degradation path directly against a path
+	// guaranteed not to exist, rather than assuming something about the
+	// test host's real /etc/resolv.conf.
+	got := parseResolvConf(filepath.Join(t.TempDir(), "etc", "resolv.conf"))
+	if got != nil {
+		t.Errorf("parseResolvConf(missing default-shaped path) = %v, want nil", got)
+	}
+}
+
 // TestEngineAndWorldEndToEnd proves the wiring, not the engine's own
 // matching logic (already covered by internal/engine's tests): a
 // buildWorld snapshot fed into a real engine.Engine allows a connection
