@@ -1,0 +1,11 @@
+defaults:
+  alert_window: 1s
+  alert_flood: 1000
+
+notifications:
+  channels:
+    - type: ntfy
+      min_level: warn
+      settings:
+        server: http://airlock-itest-ntfy:80
+        topic: airlock-itest
