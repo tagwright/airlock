@@ -68,7 +68,7 @@ services:
       # ./secrets/ntfy-airlock-token), read by internal/secret's resolver
       # before it falls back to an AIRLOCK_SECRET_<NAME> env var. Read-only:
       # airlock only ever reads a secret, never writes one. Provision this
-      # directory at deploy time (SOPS recipe in docs/DEPLOY.md); an empty
+      # directory at deploy time (SOPS recipe in docs/DEPLOY.md). An empty
       # or absent ./secrets directory is fine, it just means every secret
       # falls through to its env-var form or fails to resolve until set.
       - ./secrets:/run/airlock/secrets:ro
@@ -101,7 +101,7 @@ services:
       # your fleet whose resolution actually goes through this file.
       AIRLOCK_RESOLV_CONF: /host/etc/resolv.conf
 
-      # Matches the tmpfs mount point above; keeps the state file off the
+      # Matches the tmpfs mount point above. Keeps the state file off the
       # ./secrets bind mount's path entirely.
       AIRLOCK_STATE_PATH: /run/airlock/state/state.json
 

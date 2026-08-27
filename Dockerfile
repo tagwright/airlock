@@ -28,7 +28,7 @@
 # beacon is a different story: it is published and public
 # (github.com/tagwright/beacon), so it is fetched over the network like any
 # other module. GOPRIVATE points go at tagwright's own source for direct
-# fetches rather than the public proxy; go.sum still verifies integrity.
+# fetches rather than the public proxy. go.sum still verifies integrity.
 #
 # ONCE core is published and tagged, this simplifies to a single-context
 # build, exactly like bilgeline did after core was published: drop the
@@ -72,7 +72,7 @@ RUN CGO_ENABLED=0 go build -buildvcs=false \
 # distroless base buys nothing here: the privilege boundary this tool needs
 # is a compose/runtime concern, not a container-user concern, and eBPF
 # loading requires root regardless of what UID a distroless:nonroot base
-# would otherwise set. This image runs as root; the container MUST be run
+# would otherwise set. This image runs as root. The container MUST be run
 # --privileged (see docs/DEPLOY.md for exactly what each flag and mount is
 # for and why).
 #
@@ -97,7 +97,7 @@ FROM debian:stable-slim
 #
 # amd64 only for now. arm64 is a TODO: the v0.55.1 release also publishes
 # ig-linux-arm64-v0.55.1.tar.gz (sha256
-# e21c44cccb6e3c47044a53d54627ca2fcdb8a32e46a8d8d29fb94baa650a1cc1); wiring a
+# e21c44cccb6e3c47044a53d54627ca2fcdb8a32e46a8d8d29fb94baa650a1cc1). Wiring a
 # TARGETARCH build-arg through to pick between the two checksums is the
 # natural follow-up once this image needs to run on an arm64 host.
 ARG IG_VERSION=0.55.1
