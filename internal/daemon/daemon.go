@@ -505,9 +505,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 
 		case now := <-flush.C:
 			for _, v := range d.engine.Flush(now) {
-				if err := d.alerter.Violation(ctx, v); err != nil {
-					d.logger.Error("daemon: alert violation (flush)", "error", err)
-				}
+				d.recordAndAlertViolation(ctx, v, "flush")
 			}
 
 		case <-heartbeat.C:
@@ -533,10 +531,34 @@ func (d *Daemon) handleObserveEvent(ctx context.Context, ev observe.Event) {
 	d.health.RecordEvent(time.Now())
 
 	for _, v := range d.engine.Process(ev) {
-		d.violations.Record(v.ContainerID, v.Class.String())
-		if err := d.alerter.Violation(ctx, v); err != nil {
-			d.logger.Error("daemon: alert violation", "error", err)
-		}
+		d.recordAndAlertViolation(ctx, v, "process")
+	}
+}
+
+// recordAndAlertViolation tallies v by container and class
+// (violationTally, see tally.go -- the source for `airlock status`'s
+// per-container violation counts) and routes it through the alerter. It
+// is the single choke point both of Run's two Violation sources funnel
+// through: handleObserveEvent, for engine.Process's immediate verdicts,
+// and Run's flush case, for engine.Flush's deferred ones.
+//
+// BUG FIX (this integration pass): before this helper existed, Run's
+// flush case alerted a deferred Violation without ever tallying it, so
+// `airlock status`'s per-container violation counts silently
+// undercounted -- often all the way to zero -- every violation that went
+// through the deferred/SNI-window path. That path is not a rare corner:
+// deferral is gated only on the policy having ANY domain-based allow
+// entry (hasNameBasedAllow), so it is the common case for a realistic
+// policy, not an edge case. Confirmed live against a real daemon: a
+// connection with no name evidence at all (always deferred, since any
+// name-based allow entry qualifies for deferral) alerted correctly but
+// never appeared in state.json's violations_by_class until this fix.
+// sourceLabel distinguishes the two call sites in the error log only; it
+// has no bearing on tallying or alerting.
+func (d *Daemon) recordAndAlertViolation(ctx context.Context, v engine.Violation, sourceLabel string) {
+	d.violations.Record(v.ContainerID, v.Class.String())
+	if err := d.alerter.Violation(ctx, v); err != nil {
+		d.logger.Error("daemon: alert violation", "source", sourceLabel, "error", err)
 	}
 }
 

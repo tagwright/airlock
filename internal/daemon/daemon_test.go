@@ -179,6 +179,44 @@ func TestDaemon_HandleObserveEvent_ArmedConnectionRecordsRealVerdict(t *testing.
 	}
 }
 
+// TestRecordAndAlertViolation_TalliesRegardlessOfSource pins the fix this
+// integration pass made: BOTH of Run's Violation sources -- Process's
+// immediate verdicts (handleObserveEvent) and Flush's deferred ones (the
+// flush case in Run's select loop) -- must tally into d.violations, since
+// `airlock status`'s per-container violation counts read that tally, not
+// the alerter. Before recordAndAlertViolation existed as a shared choke
+// point, Run's flush case alerted a deferred Violation without ever
+// tallying it: confirmed live, a real deferred connection (the common
+// case, since deferral applies to any policy with a domain-based allow
+// entry) alerted correctly but never appeared in state.json's
+// violations_by_class. This test calls recordAndAlertViolation directly
+// -- the same method both Run call sites now use -- so a regression that
+// reintroduces two independent, drifting call sites would still be caught
+// here as long as both keep routing through it.
+func TestRecordAndAlertViolation_TalliesRegardlessOfSource(t *testing.T) {
+	cfg := newTestConfig(t)
+	d := newTestDaemon(t, cfg, &fakeRuntime{})
+	ctx := context.Background()
+
+	v := engine.Violation{
+		Service:     "web",
+		Destination: "1.1.1.1",
+		Port:        443,
+		Class:       engine.ClassUnresolvedIP,
+		ContainerID: "c1",
+		Timestamp:   time.Now(),
+	}
+
+	for _, source := range []string{"process", "flush"} {
+		d.recordAndAlertViolation(ctx, v, source)
+	}
+
+	tally := d.violations.Snapshot()
+	if got := tally["c1"]["unresolved-ip"]; got != 2 {
+		t.Fatalf("violations tally for c1/unresolved-ip = %d, want 2 (one per recordAndAlertViolation call, regardless of source label)", got)
+	}
+}
+
 func TestBuildRuntime_UnknownRuntimeErrors(t *testing.T) {
 	t.Setenv("AIRLOCK_RUNTIME", "bogus")
 	cfg := newTestConfig(t)
