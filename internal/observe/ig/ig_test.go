@@ -6,11 +6,49 @@ import (
 	"context"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 
 	"github.com/tagwright/airlock/internal/observe"
 )
+
+// TestDefaultCommandBuilder_AlwaysAutoMountsFilesystems pins the exact
+// argument list defaultCommandBuilder produces, most importantly that
+// --auto-mount-filesystems is always present. This is a regression test
+// for a real bug this integration pass found: confirmed against a live
+// v0.55.1 `ig run` inside airlock's own packaged image, without this flag
+// ig fails its ENTIRE startup ("filesystems debugfs, tracefs not
+// mounted") on every gadget, every time, because nothing else in that
+// image's startup mounts them. See defaultCommandBuilder's doc comment.
+func TestDefaultCommandBuilder_AlwaysAutoMountsFilesystems(t *testing.T) {
+	opts := Options{IGPath: "ig", Runtimes: "docker", DockerSocketPath: "/run/docker.sock"}.withDefaults()
+	s := source{name: gadgetTraceTCP, image: DefaultTraceTCPImage, parse: parseTCPLine}
+
+	cmd := defaultCommandBuilder(context.Background(), s, opts)
+
+	want := []string{
+		"ig", "run", DefaultTraceTCPImage, "-o", "json", "--auto-mount-filesystems",
+		"-r", "docker", "--docker-socketpath", "/run/docker.sock",
+	}
+	if !reflect.DeepEqual(cmd.Args, want) {
+		t.Fatalf("defaultCommandBuilder args = %v, want %v", cmd.Args, want)
+	}
+}
+
+// TestDefaultCommandBuilder_MinimalOptions confirms the bare-minimum
+// invocation (no Runtimes, no DockerSocketPath set) still always carries
+// -o json and --auto-mount-filesystems, and omits the two optional flags
+// entirely rather than passing them empty.
+func TestDefaultCommandBuilder_MinimalOptions(t *testing.T) {
+	s := source{name: gadgetTraceDNS, image: DefaultTraceDNSImage, parse: parseDNSLine}
+	cmd := defaultCommandBuilder(context.Background(), s, Options{IGPath: "ig"})
+
+	want := []string{"ig", "run", DefaultTraceDNSImage, "-o", "json", "--auto-mount-filesystems"}
+	if !reflect.DeepEqual(cmd.Args, want) {
+		t.Fatalf("defaultCommandBuilder args = %v, want %v", cmd.Args, want)
+	}
+}
 
 // fakeIGScript is a stand-in for the real ig binary. Each invocation
 // increments a counter file (so successive restarts are distinguishable)

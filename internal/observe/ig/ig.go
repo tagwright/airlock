@@ -182,8 +182,24 @@ type source struct {
 
 // defaultCommandBuilder builds the real "ig run <image> -o json ..."
 // subprocess command for a source.
+//
+// --auto-mount-filesystems is always passed. BUG FIX (this integration
+// pass): confirmed against a real v0.55.1 `ig run` inside airlock's own
+// packaged image (Dockerfile's debian:stable-slim final stage, the raw
+// release binary with no wrapper around it, run --privileged/--pid=host/
+// with the docker-compose.yml-documented mounts): without this flag, ig
+// fails its entire startup with "filesystems debugfs, tracefs not
+// mounted" every time, because nothing in that image's own startup
+// mounts them (unlike, apparently, upstream's own ghcr.io/inspektor-
+// gadget/ig container image, which this adapter was validated against
+// directly and does not hit this -- its own entrypoint evidently handles
+// this already). Airlock always runs ig as a dedicated, already-
+// privileged subprocess whose only job is loading eBPF, so there is no
+// deployment shape where letting ig mount its own bpffs/debugfs/tracefs
+// is undesirable; this is not made an Options field because no caller
+// has a reason to turn it off.
 func defaultCommandBuilder(ctx context.Context, s source, opts Options) *exec.Cmd {
-	args := []string{"run", s.image, "-o", "json"}
+	args := []string{"run", s.image, "-o", "json", "--auto-mount-filesystems"}
 	if opts.Runtimes != "" {
 		args = append(args, "-r", opts.Runtimes)
 	}
