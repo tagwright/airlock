@@ -4,6 +4,7 @@ package daemon
 
 import (
 	"net/netip"
+	"sort"
 	"time"
 
 	"github.com/tagwright/airlock/internal/config"
@@ -133,14 +134,32 @@ type containerDiagnostic struct {
 	diag          discovery.Diagnostic
 }
 
+// armedContainerMeta is the status-worthy slice of one armed container's
+// resolved state, carried alongside (not inside) world's own policy map so
+// the state-snapshot writer (state.go) can read a plain, thread-safe
+// snapshot of it via Daemon.armedMeta without touching world at all -- see
+// world's own "deliberately NOT safe for concurrent access" type doc
+// comment for why that boundary matters.
+type armedContainerMeta struct {
+	id            string
+	name          string
+	service       string
+	mode          string
+	scope         string
+	matchedGroups []string
+}
+
 // buildResult is buildWorld's return value: the freshly built world, every
-// diagnostic produced while resolving the fleet's policies, and the
+// diagnostic produced while resolving the fleet's policies, the
 // per-service alert window every armed container's resolved policy
-// carries (for the caller to feed to alert.Alerter.SetWindow).
+// carries (for the caller to feed to alert.Alerter.SetWindow), and the
+// status-worthy metadata for every armed container, sorted by id for a
+// stable snapshot (for the caller to store on Daemon.armedMeta).
 type buildResult struct {
 	world       *world
 	diagnostics []containerDiagnostic
 	windows     map[string]time.Duration
+	armed       []armedContainerMeta
 }
 
 // buildWorld is the pure heart of a reconcile pass: given a fresh listing
@@ -176,6 +195,7 @@ func buildWorld(containers []runtime.Container, networks []runtime.Network, cfg 
 
 	var diags []containerDiagnostic
 	windows := make(map[string]time.Duration)
+	var armed []armedContainerMeta
 
 	for _, c := range containers {
 		lp, ldiags := discovery.ReadLabels(c.Labels)
@@ -191,6 +211,15 @@ func buildWorld(containers []runtime.Container, networks []runtime.Network, cfg 
 		if !resolved.Armed {
 			continue
 		}
+
+		armed = append(armed, armedContainerMeta{
+			id:            c.ID,
+			name:          c.Name,
+			service:       resolved.Policy.Name,
+			mode:          resolved.Policy.Mode.String(),
+			scope:         resolved.Policy.Scope.String(),
+			matchedGroups: append([]string(nil), resolved.MatchedGroups...),
+		})
 
 		// JUDGMENT CALL: the AIRLOCK_IMPLICIT_ALLOW extension entries
 		// (the non-resolver-shaped ones -- domains, CIDRs, tokens, or
@@ -218,7 +247,9 @@ func buildWorld(containers []runtime.Container, networks []runtime.Network, cfg 
 		}
 	}
 
-	return buildResult{world: w, diagnostics: diags, windows: windows}
+	sort.Slice(armed, func(i, j int) bool { return armed[i].id < armed[j].id })
+
+	return buildResult{world: w, diagnostics: diags, windows: windows, armed: armed}
 }
 
 // implicitAllowEntries parses cfg.Defaults.ImplicitAllow's raw entries

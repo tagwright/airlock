@@ -5,8 +5,12 @@
 // internal/resolve, internal/discovery, internal/alert, and
 // github.com/tagwright/core's runtime abstraction) into one running
 // program. It builds the container runtime and the observation backend,
-// keeps a live World snapshot (world.go) the policy engine reads, and
-// runs the event loop that turns observed egress into alerts.
+// keeps a live World snapshot (world.go) the policy engine reads, runs the
+// event loop that turns observed egress into alerts, and periodically
+// writes the JSON state snapshot (state.go) that is the file-based
+// CLI<->daemon contract behind `airlock status` and `airlock suggest` --
+// see state.go's package-level DESIGN comment for why a file rather than
+// an IPC server.
 //
 // # Concurrency
 //
@@ -14,12 +18,17 @@
 // ever calls engine.Process, engine.Flush, or reconcile (which mutates
 // the World snapshot those two read). This is the architecture's
 // documented "simplest correct design": no snapshot lock is needed
-// because there is never a second goroutine touching it. Three
-// timers/sources run on their own goroutines and are explicitly
-// documented, everywhere they appear, to touch ONLY the thread-safe
-// alert.Alerter (and, for the digest, the also-thread-safe suggestStore):
-// the digest cron (github.com/robfig/cron/v3, its own internal
-// goroutine), and nothing else needs one, since the observe backend's own
+// because there is never a second goroutine touching it. Every
+// timer/source that runs on its own goroutine is explicitly documented,
+// everywhere it appears, to touch ONLY thread-safe read/write-sides: the
+// digest cron (github.com/robfig/cron/v3, its own internal goroutine)
+// touches d.alerter and d.unpolicied (fed from d.engine.ObservedSnapshot,
+// itself thread-safe -- see observed.go's own concurrency doc comment);
+// the state-snapshot writer (state.go's runStateWriter, this package's own
+// goroutine) touches d.engine.ObservedSnapshot, d.alerter.SuppressedByService,
+// d.health, d.violations, and d.armedMeta (an atomic.Pointer written once
+// per reconcile by the main goroutine). Nothing on either of those
+// goroutines ever touches d.world directly. The observe backend's own
 // channels and the runtime's own Watch channel are both consumed
 // synchronously inside Run's select loop, never fanned out to a second
 // goroutine of this package's own making.
@@ -32,6 +41,7 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/robfig/cron/v3"
@@ -109,7 +119,17 @@ type Daemon struct {
 	alerter *alert.Alerter
 	engine  *engine.Engine
 	world   *world
-	store   *suggestStore
+
+	// health, violations, and unpolicied are this package's own small
+	// thread-safe read/write-sides for the state-snapshot writer and the
+	// digest cron, both of which run on their own goroutines -- see the
+	// package doc comment's concurrency section. armedMeta is written
+	// once per reconcile (the main goroutine) and read with no lock at
+	// all by the state-snapshot writer, via atomic.Pointer.
+	health     *backendHealthTracker
+	violations *violationTally
+	unpolicied *unpoliciedTracker
+	armedMeta  atomic.Pointer[[]armedContainerMeta]
 
 	selfID string
 
@@ -117,6 +137,8 @@ type Daemon struct {
 	flushInterval     time.Duration
 	debounce          time.Duration
 	resolvConfPath    string
+	statePath         string
+	stateInterval     time.Duration
 }
 
 // New constructs a Daemon from cfg: it selects and constructs the
@@ -160,23 +182,20 @@ func New(ctx context.Context, cfg *config.Config, logger *slog.Logger) (*Daemon,
 		alerter:           alerter,
 		engine:            engine.New(w),
 		world:             w,
-		store:             newSuggestStore(),
+		health:            newBackendHealthTracker(backend.Name()),
+		violations:        newViolationTally(),
+		unpolicied:        newUnpoliciedTracker(),
 		heartbeatInterval: heartbeatInterval(),
 		flushInterval:     flushInterval,
 		debounce:          reconcileDebounce,
 		resolvConfPath:    resolvConfPath(),
+		statePath:         StatePath(),
+		stateInterval:     resolveStateInterval(),
 	}
 	d.selfID = resolveSelfID(ctx, rt, logger)
 
 	return d, nil
 }
-
-// Suggestions exposes the daemon's observed-egress recorder for an
-// in-process reader (a future `airlock suggest`, or a status
-// endpoint built on top of this same process). See suggestStore's doc
-// comment for why a separate-process CLI invocation cannot reach this
-// directly.
-func (d *Daemon) Suggestions() []Suggestion { return d.store.Snapshot() }
 
 // buildRuntime selects and constructs the container runtime.
 // AIRLOCK_RUNTIME picks docker (the default) or podman; AIRLOCK_SOCKET
@@ -346,6 +365,13 @@ func (d *Daemon) Run(ctx context.Context) error {
 	cronRunner.Start()
 	defer func() { <-cronRunner.Stop().Done() }()
 
+	stateDone := make(chan struct{})
+	go func() {
+		defer close(stateDone)
+		d.runStateWriter(ctx)
+	}()
+	defer func() { <-stateDone }()
+
 	heartbeat := time.NewTicker(d.heartbeatInterval)
 	defer heartbeat.Stop()
 
@@ -454,38 +480,40 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}
 }
 
-// handleObserveEvent feeds one observe.Event through the engine and
-// routes any resulting Violations to the alerter. A Connection from a
-// container the current World does not consider armed (unarmed by policy,
-// or simply not yet known to this snapshot) is additionally recorded in
-// the suggest store: an unpolicied container is exactly the case the
-// unpolicied-digest summary and a future `airlock suggest` both want data
-// about. Called only from Run's own goroutine.
+// handleObserveEvent feeds one observe.Event through the engine and routes
+// any resulting Violations to the alerter, tallying each by container and
+// class along the way (violationTally, see tally.go) for `airlock
+// status`'s per-container violation counts. It also stamps the backend
+// health tracker's last-event time, since an event actually reaching this
+// method is the liveness signal `airlock status`'s "events flowing" reads.
+// The engine's own observed-egress recorder (internal/engine/observed.go)
+// records unpolicied and suggest data directly inside Process/
+// evaluateConnection, so there is nothing left for this method to do for
+// an unarmed container's connection beyond what Process already did.
+// Called only from Run's own goroutine.
 func (d *Daemon) handleObserveEvent(ctx context.Context, ev observe.Event) {
+	d.health.RecordEvent(time.Now())
+
 	for _, v := range d.engine.Process(ev) {
+		d.violations.Record(v.ContainerID, v.Class.String())
 		if err := d.alerter.Violation(ctx, v); err != nil {
 			d.logger.Error("daemon: alert violation", "error", err)
 		}
 	}
-
-	if ev.Kind != observe.Connection {
-		return
-	}
-	if _, armed := d.world.ResolvedPolicy(ev.ContainerID); armed {
-		return
-	}
-	d.store.Record(ev.ContainerID, ev.ContainerName, ev.DstIP.Unmap().String(), ev.DstPort, ev.Timestamp)
 }
 
-// handleStat logs an observe.Stat as the operational signal it is: a
-// nonzero DroppedEvents is treated as the tamper/loss signal the frozen
-// architecture calls out (logged at Error, since it means airlock may
-// have missed connections without anyone otherwise knowing); a bare
+// handleStat logs an observe.Stat as the operational signal it is, and
+// folds it into the backend health tracker (health.go) for `airlock
+// status`. A nonzero DroppedEvents is treated as the tamper/loss signal the
+// frozen architecture calls out (logged at Error, since it means airlock
+// may have missed connections without anyone otherwise knowing); a bare
 // restart with no reported loss is logged at Warn, since sustained
 // restarts under load are the same ring-buffer-flooding shape even when a
 // specific backend cannot yet count the drops itself (see
 // internal/observe/ig's package-level TODO on this exact gap).
 func (d *Daemon) handleStat(st observe.Stat) {
+	d.health.RecordStat(st)
+
 	if st.DroppedEvents > 0 {
 		d.logger.Error("daemon: observe backend reported dropped events (possible tamper or ring-buffer overflow)",
 			"source", st.Source, "dropped_events", st.DroppedEvents, "restarts", st.Restarts, "message", st.Message)
@@ -527,13 +555,13 @@ func relevantRuntimeEvent(t runtime.EventType) bool {
 }
 
 // runDigest feeds the pending unpolicied-first-seen summary (gated by
-// cfg.Defaults.UnpoliciedDigest) and fires the periodic digest. Called
-// from the cron library's own goroutine -- see the package doc comment's
-// concurrency section -- it touches only d.store and d.alerter, both
-// independently thread-safe, never d.world or d.engine.
+// cfg.Defaults.UnpoliciedDigest) and fires the periodic digest. Called from
+// the cron library's own goroutine -- see the package doc comment's
+// concurrency section -- it touches only d.alerter, d.unpolicied, and
+// d.engine.ObservedSnapshot, all independently thread-safe, never d.world.
 func (d *Daemon) runDigest(ctx context.Context) {
 	if d.cfg.Defaults.UnpoliciedDigest {
-		d.alerter.FeedUnpoliciedSummary(d.store.PendingDigestSummary())
+		d.alerter.FeedUnpoliciedSummary(d.unpolicied.NewSince(d.engine.ObservedSnapshot()))
 	}
 	if err := d.alerter.Digest(ctx); err != nil {
 		d.logger.Error("daemon: digest failed", "error", err)
@@ -573,6 +601,7 @@ func (d *Daemon) reconcile(ctx context.Context) error {
 	}
 
 	d.world.replace(result.world)
+	d.armedMeta.Store(&result.armed)
 
 	d.logger.Debug("daemon: reconcile complete",
 		"containers", len(containers),

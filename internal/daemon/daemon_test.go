@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"net/netip"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -37,11 +38,15 @@ func newTestDaemon(t *testing.T, cfg *config.Config, rt *fakeRuntime) *Daemon {
 		alerter:           alerter,
 		engine:            engine.New(w),
 		world:             w,
-		store:             newSuggestStore(),
+		health:            newBackendHealthTracker("test"),
+		violations:        newViolationTally(),
+		unpolicied:        newUnpoliciedTracker(),
 		heartbeatInterval: time.Minute,
 		flushInterval:     100 * time.Millisecond,
 		debounce:          10 * time.Millisecond,
 		resolvConfPath:    "/nonexistent-resolv-conf-for-airlock-tests",
+		statePath:         filepath.Join(t.TempDir(), "state.json"),
+		stateInterval:     time.Hour,
 	}
 }
 
@@ -119,7 +124,7 @@ func TestDaemon_HandleRuntimeEvent_IrrelevantEventDoesNotArm(t *testing.T) {
 	}
 }
 
-func TestDaemon_HandleObserveEvent_RecordsUnarmedConnectionForSuggest(t *testing.T) {
+func TestDaemon_HandleObserveEvent_RecordsUnarmedConnectionAsObserved(t *testing.T) {
 	cfg := newTestConfig(t)
 	// c1 is present in the world but carries no airlock labels at all,
 	// so it resolves unarmed.
@@ -134,19 +139,22 @@ func TestDaemon_HandleObserveEvent_RecordsUnarmedConnectionForSuggest(t *testing
 
 	d.handleObserveEvent(ctx, observe.Event{
 		Kind: observe.Connection, ContainerID: "c1", ContainerName: "plain",
-		DstIP: mustAddr(t, "198.51.100.7"), DstPort: 443, Timestamp: time.Now(),
+		DstIP: mustAddr(t, "198.51.100.7"), DstPort: 443, Proto: "tcp", Timestamp: time.Now(),
 	})
 
-	got := d.store.ContainerSnapshot("c1")
+	got := d.engine.Observed("c1")
 	if len(got) != 1 {
-		t.Fatalf("ContainerSnapshot(c1) = %+v, want exactly one recorded destination", got)
+		t.Fatalf("engine.Observed(c1) = %+v, want exactly one recorded destination", got)
 	}
-	if got[0].Destination != "198.51.100.7" || got[0].Port != 443 {
-		t.Errorf("recorded suggestion = %+v, want 198.51.100.7:443", got[0])
+	if got[0].DstIP.String() != "198.51.100.7" || got[0].Port != 443 {
+		t.Errorf("recorded observation = %+v, want 198.51.100.7:443", got[0])
+	}
+	if got[0].Verdict != "observed" {
+		t.Errorf("recorded verdict = %q, want %q (unarmed container)", got[0].Verdict, "observed")
 	}
 }
 
-func TestDaemon_HandleObserveEvent_ArmedConnectionNotRecordedForSuggest(t *testing.T) {
+func TestDaemon_HandleObserveEvent_ArmedConnectionRecordsRealVerdict(t *testing.T) {
 	cfg := newTestConfig(t)
 	c := armedContainer("c1", "web", map[string]string{"airlock.allow": "*"})
 	rt := &fakeRuntime{containers: []runtime.Container{c}}
@@ -159,11 +167,15 @@ func TestDaemon_HandleObserveEvent_ArmedConnectionNotRecordedForSuggest(t *testi
 
 	d.handleObserveEvent(ctx, observe.Event{
 		Kind: observe.Connection, ContainerID: "c1", ContainerName: "web",
-		DstIP: mustAddr(t, "198.51.100.7"), DstPort: 443, Timestamp: time.Now(),
+		DstIP: mustAddr(t, "198.51.100.7"), DstPort: 443, Proto: "tcp", Timestamp: time.Now(),
 	})
 
-	if got := d.store.ContainerSnapshot("c1"); len(got) != 0 {
-		t.Errorf("ContainerSnapshot(c1) for an armed container = %+v, want none recorded", got)
+	got := d.engine.Observed("c1")
+	if len(got) != 1 {
+		t.Fatalf("engine.Observed(c1) = %+v, want exactly one recorded destination", got)
+	}
+	if got[0].Verdict != "allowed" {
+		t.Errorf("recorded verdict for an armed, allow: \"*\" container = %q, want %q", got[0].Verdict, "allowed")
 	}
 }
 

@@ -571,6 +571,28 @@ func (a *Alerter) FeedUnpoliciedSummary(lines []string) {
 	a.unpolicied = cp
 }
 
+// SuppressedByService returns, for every service with currently pending
+// digest-scoped suppressed repeats, the summed suppressed count across
+// every distinct alert identity (destination, port, class) under that
+// service name. It is a read-only snapshot -- unlike Digest's
+// drainSuppressedLocked, it does not reset anything -- meant for a
+// status-snapshot writer (the daemon's periodic state-file dump) that wants
+// "how many repeats are currently buffered for this service's next alert
+// or digest" without disturbing the alert-volume contract's own counters.
+// Safe to call from any goroutine.
+func (a *Alerter) SuppressedByService() map[string]int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	out := make(map[string]int)
+	for id, st := range a.identities {
+		if st.suppressedForDigest > 0 {
+			out[id.Service] += st.suppressedForDigest
+		}
+	}
+	return out
+}
+
 // Report pushes a health heartbeat through beacon's configured telemetry
 // sinks (e.g. a Gatus external endpoint), for the dead-man's-switch leg.
 // The daemon calls this periodically; no timer lives in this package. A

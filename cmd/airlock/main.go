@@ -1,17 +1,19 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// Command airlock is the entrypoint for the airlock egress-visibility tool.
-//
-// This is an early scaffold. There is no real functionality yet: it just
-// prints a startup banner and exits.
+// Command airlock is the entrypoint for the airlock egress-visibility
+// tool. This file is a thin main: it hands control to internal/cli, which
+// owns the whole command tree (daemon, validate, version, status,
+// suggest).
 package main
 
 import (
-	"fmt"
+	"os"
 
-	"github.com/tagwright/airlock/internal/version"
+	"github.com/tagwright/airlock/internal/cli"
 )
 
 func main() {
-	fmt.Printf("airlock %s starting (scaffold, no functionality yet)\n", version.Version)
+	if err := cli.Execute(); err != nil {
+		os.Exit(1)
+	}
 }

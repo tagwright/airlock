@@ -44,8 +44,9 @@
 // policy with a name-based allow entry is held briefly (see sniWindow) so
 // a same-container SNI that lands just after the connect can still
 // resolve it. Process still takes an internal lock so that a second
-// goroutine may safely call Flush, or a future status/suggest snapshot,
-// concurrently with the single feeder goroutine; that lock is not a
+// goroutine may safely call Flush, or the observed-egress recorder's
+// ObservedSnapshot/Observed (see observed.go), concurrently with the
+// single feeder goroutine; that lock is not a
 // substitute for feeding events out of order and expecting correct
 // correlation, and it is not a substitute for actually calling Flush --
 // see Flush's doc comment.
@@ -70,15 +71,30 @@ type Engine struct {
 	dns     map[string]*dnsCache
 	sni     map[string]*sniStore
 	pending map[string][]*pendingConn
+
+	// observed is the bounded per-container observed-egress recorder (see
+	// observed.go): every external, in-scope destination seen from a
+	// container, armed or not, with the best name evidence available at
+	// observation time. It is guarded by the SAME mu as the correlation
+	// state above, not a dedicated mutex: recordObserved is only ever
+	// called from within evaluateConnection, itself only ever reached from
+	// Process, which already holds mu for its entire body, so folding the
+	// recorder under the existing lock costs nothing on the hot path and
+	// avoids a second lock a reader would otherwise need to acquire in the
+	// right order relative to Process/Flush. ObservedSnapshot and Observed
+	// take mu themselves for a reader on any other goroutine (a daemon's
+	// periodic status-snapshot writer, in practice).
+	observed map[string]*observedContainer
 }
 
 // New constructs an Engine reading live state from world.
 func New(world World) *Engine {
 	return &Engine{
-		world:   world,
-		dns:     make(map[string]*dnsCache),
-		sni:     make(map[string]*sniStore),
-		pending: make(map[string][]*pendingConn),
+		world:    world,
+		dns:      make(map[string]*dnsCache),
+		sni:      make(map[string]*sniStore),
+		pending:  make(map[string][]*pendingConn),
+		observed: make(map[string]*observedContainer),
 	}
 }
 
@@ -133,6 +149,7 @@ func (e *Engine) Forget(containerID string) {
 	delete(e.dns, containerID)
 	delete(e.sni, containerID)
 	delete(e.pending, containerID)
+	delete(e.observed, containerID)
 }
 
 // recordDNS updates the answering container's DNS cache from ev. Answers
@@ -203,24 +220,31 @@ func (e *Engine) sniStoreLookup(containerID string, now time.Time) (string, bool
 // hasNameBasedAllow.
 func (e *Engine) evaluateConnection(ev observe.Event) []Violation {
 	// (a) Resolve the container's policy. Unarmed or unknown means
-	// observed but never policy-judged.
+	// observed but never policy-judged -- the connection may still be
+	// worth recording for the observed-egress recorder below, just never
+	// matched against Allow/Deny.
 	pol, armed := e.world.ResolvedPolicy(ev.ContainerID)
-	if !armed {
-		return nil
-	}
 
 	dst := ev.DstIP.Unmap()
 
 	// (b) Scope classification: loopback is never egress; the runtime's
 	// own container networks are out of scope under External and in
 	// scope under All; everything else (the LAN included) is in scope
-	// under both.
+	// under both. An unarmed container has no resolved Scope of its own,
+	// so the recorder uses the frozen doc's fleet-wide default (External)
+	// for the same "keep the first allowlist about the outside world"
+	// reason Scope defaults to External for an armed one -- see
+	// recordObserved's callers below.
 	if dst.IsLoopback() {
 		return nil
 	}
 	nets := e.world.Networks()
 	own := inOwnNetworks(nets, dst)
-	if own && pol.Scope == policy.External {
+	scope := policy.External
+	if armed {
+		scope = pol.Scope
+	}
+	if own && scope == policy.External {
 		return nil
 	}
 
@@ -237,6 +261,11 @@ func (e *Engine) evaluateConnection(ev observe.Event) []Violation {
 	name := dnsName
 	if sniOK {
 		name = sniName
+	}
+
+	if !armed {
+		e.recordObserved(ev.ContainerID, ev.ContainerName, dst, ev.DstPort, ev.Proto, name, ev.Timestamp, "observed")
+		return nil
 	}
 
 	// (e) Match against the policy: deny beats allow beats the
@@ -262,18 +291,24 @@ func (e *Engine) evaluateConnection(ev observe.Event) []Violation {
 		if matchEntry(d, ctx) {
 			// Deny is definitive at connect time: never deferred,
 			// regardless of what a later SNI might say.
+			e.recordObserved(ev.ContainerID, ev.ContainerName, dst, ev.DstPort, ev.Proto, name, ev.Timestamp, ClassDeny.String())
 			return []Violation{*e.buildViolation(pol, ev, dst, name, dnsName, sniName, ClassDeny)}
 		}
 	}
 	for _, a := range pol.Allow {
 		if matchEntry(a, ctx) {
+			e.recordObserved(ev.ContainerID, ev.ContainerName, dst, ev.DstPort, ev.Proto, name, ev.Timestamp, "allowed")
 			return nil
 		}
 	}
 
 	// (f) Default-deny floor: unresolved-ip when there was no name
 	// evidence at all, no-match otherwise.
-	//
+	class := ClassNoMatch
+	if !hasName {
+		class = ClassUnresolvedIP
+	}
+
 	// Before returning it as an immediate violation, consider deferral:
 	// a late SNI arriving just after this connect can only ever change
 	// this verdict if (1) this container has no SNI evidence for this
@@ -281,15 +316,21 @@ func (e *Engine) evaluateConnection(ev observe.Event) []Violation {
 	// and nothing more can arrive to help -- and (2) the policy actually
 	// has a name-based (Domain or DomainWildcard) allow entry for a late
 	// SNI to satisfy in the first place. A pure-IP-and-token policy can
-	// never be rescued by a name, so it is never worth the delay.
+	// never be rescued by a name, so it is never worth the delay. Either
+	// way the recorder gets this connection's verdict as of right now:
+	// the class it would carry if a late SNI does not go on to rescue it.
+	// The recorder is a best-effort suggest/status aid, not a security
+	// verdict, so a rare case where a deferred connection is later
+	// rescued into an allow leaves a slightly stale "no-match"/
+	// "unresolved-ip" entry rather than "allowed" -- harmless, since the
+	// destination was reached either way and is exactly what an operator
+	// building an allowlist wants to see.
+	e.recordObserved(ev.ContainerID, ev.ContainerName, dst, ev.DstPort, ev.Proto, name, ev.Timestamp, class.String())
+
 	if !sniOK && hasNameBasedAllow(pol) {
 		return e.deferPending(ev, pol, dst, ctx)
 	}
 
-	class := ClassNoMatch
-	if !hasName {
-		class = ClassUnresolvedIP
-	}
 	return []Violation{*e.buildViolation(pol, ev, dst, name, dnsName, sniName, class)}
 }
 
