@@ -23,33 +23,61 @@
 //     World data and testing a connection's destination and name evidence
 //     against a policy's Allow and Deny lists, deny beats allow beats the
 //     default-deny floor, and classifying the result (deny, no-match, or
-//     the exfiltration-shaped unresolved-ip when there was no name
-//     evidence at all).
+//     the exfiltration-shaped unresolved-ip when there was no trustworthy
+//     name evidence at all).
 //
 // See world.go, violation.go, dns.go, sni.go, scope.go, and match.go for
 // each piece, and the frozen doc's "What a rule can honestly promise"
 // section for the reasoning this package is built against.
 //
+// # SNI is fail-closed: enrichment only, never a match input
+//
+// An earlier version of this package let a recent same-container SNI
+// observation satisfy a Domain/DomainWildcard allow or deny entry,
+// preferring it over a DNS-cache correlation on disagreement, and even
+// briefly deferred a would-be violation's verdict to give a same-container
+// SNI observed just after the connect a chance to rescue it (see git
+// history for pending.go, since removed). A real integration pass
+// reproduced why that is unsafe: trace_sni carries no destination IP at
+// all, so it can only be tied to a Connection by same-container-plus-
+// timing, and that timing-only join reproducibly misattributed one
+// connection's SNI to a DIFFERENT, unrelated connection from the same
+// container fired moments later -- concretely, a container's TWO rapid
+// connections (one with a real SNI, one bare-IP with none) resulted in the
+// bare-IP one being classified ALLOWED, because the first connection's SNI
+// was still the temporally-closest record in the store when the second was
+// evaluated. That is a false negative in a security tool: a genuinely
+// disallowed connection silently marked allowed. See docs/TESTING.md for
+// the full reproduction.
+//
+// Nate ratified fail-closed on SNI as the fix: a Domain/DomainWildcard
+// entry -- allow or deny alike -- now matches a connection ONLY via a
+// DNS-cache correlation for THIS container's own recent answers (a hard
+// IP-to-name lookup, no timing involved). SNI is never consulted by
+// matchEntry and can therefore never change a verdict, in either
+// direction. sniStore and the TLSHello Process path still exist, and
+// still matter: the observed SNI name, when there is one, is carried
+// through on both Violation (DNSName/SNIName) and ObservedDest
+// (Name/SNIName) purely as enrichment for a human reading an alert or a
+// suggest line -- see buildViolation and observed.go's recordObserved.
+// IP/CIDR/token/AnyDest entries are unaffected: they were never SNI-
+// dependent to begin with, since they match ground-truth connection facts
+// (the destination address) or live World data, not a name.
+//
+// One consequence: deferring a verdict to wait for a same-container SNI
+// no longer has anything to accomplish (DNS precedes the connect, so
+// DNS-based name matching is already available at connect time), so
+// Process(Connection) now always returns its final verdict synchronously,
+// at most one Violation, with no pending queue and no Flush call for a
+// daemon to make.
+//
 // Concurrency: Engine is designed to be fed by exactly one goroutine
 // calling Process in the order events were observed -- the daemon is
 // expected to serialize its observation stream before handing events to
-// the engine, since evaluation order matters (a DNSAnswer or TLSHello must
-// be processed before the Connection it is meant to inform, or it simply
-// arrives too late to help that one connection, which is the ordinary
-// case for SNI: a TLS ClientHello is emitted after the TCP connect it
-// rides on, so it usually reaches Process strictly after the Connection
-// event it should inform). pending.go's deferred verdicts exist
-// specifically to absorb that ordinary case for the one situation it can
-// change an answer: a would-be default-deny-floor violation against a
-// policy with a name-based allow entry is held briefly (see sniWindow) so
-// a same-container SNI that lands just after the connect can still
-// resolve it. Process still takes an internal lock so that a second
-// goroutine may safely call Flush, or the observed-egress recorder's
-// ObservedSnapshot/Observed (see observed.go), concurrently with the
-// single feeder goroutine; that lock is not a
-// substitute for feeding events out of order and expecting correct
-// correlation, and it is not a substitute for actually calling Flush --
-// see Flush's doc comment.
+// the engine. Process still takes an internal lock so that a second
+// goroutine may safely call the observed-egress recorder's
+// ObservedSnapshot/Observed (see observed.go) concurrently with the single
+// feeder goroutine.
 package engine
 
 import (
@@ -67,10 +95,9 @@ import (
 type Engine struct {
 	world World
 
-	mu      sync.Mutex
-	dns     map[string]*dnsCache
-	sni     map[string]*sniStore
-	pending map[string][]*pendingConn
+	mu  sync.Mutex
+	dns map[string]*dnsCache
+	sni map[string]*sniStore
 
 	// observed is the bounded per-container observed-egress recorder (see
 	// observed.go): every external, in-scope destination seen from a
@@ -81,8 +108,8 @@ type Engine struct {
 	// Process, which already holds mu for its entire body, so folding the
 	// recorder under the existing lock costs nothing on the hot path and
 	// avoids a second lock a reader would otherwise need to acquire in the
-	// right order relative to Process/Flush. ObservedSnapshot and Observed
-	// take mu themselves for a reader on any other goroutine (a daemon's
+	// right order relative to Process. ObservedSnapshot and Observed take
+	// mu themselves for a reader on any other goroutine (a daemon's
 	// periodic status-snapshot writer, in practice).
 	observed map[string]*observedContainer
 }
@@ -93,29 +120,20 @@ func New(world World) *Engine {
 		world:    world,
 		dns:      make(map[string]*dnsCache),
 		sni:      make(map[string]*sniStore),
-		pending:  make(map[string][]*pendingConn),
 		observed: make(map[string]*observedContainer),
 	}
 }
 
-// Process consumes one normalized observation and returns the Violations
-// it produced immediately: none for a DNSAnswer (it only updates
-// correlation state); none for a TLSHello beyond what it drops from
-// pending (it updates the SNI store and may clear a deferred verdict, but
-// never itself returns a violation); and for a Connection, zero, one, or
-// -- only when a full pending queue forces an unrelated earlier
-// connection out early, see deferPending -- two: the triggering
-// connection's own immediate verdict (deny, an immediate default-deny
-// floor violation, or none if allowed or deferred) plus, rarely, the
-// forced-out one. Evaluation of a Connection is still at connect time
-// only in the sense that it is judged exactly once here or, for the
-// narrow deferred case, once more at Flush; it is never re-judged twice
-// with two different outcomes. An event of an unrecognized Kind is
-// ignored.
+// Process consumes one normalized observation and returns the Violation(s)
+// it produced: none for a DNSAnswer or TLSHello (they only update
+// correlation state -- see the package doc comment's note on SNI being
+// enrichment-only), and zero or one for a Connection, decided synchronously
+// and finally right here (evaluation is at connect time only, per the
+// frozen doc, so a Connection is judged exactly once, ever). An event of an
+// unrecognized Kind is ignored.
 //
 // See the package doc comment for the single-feeder-goroutine assumption
-// this method relies on for correlation ordering, and Flush's doc comment
-// for what makes a deferred verdict actually surface.
+// this method relies on for correlation ordering.
 func (e *Engine) Process(ev observe.Event) []Violation {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -125,30 +143,31 @@ func (e *Engine) Process(ev observe.Event) []Violation {
 		e.recordDNS(ev)
 		return nil
 	case observe.TLSHello:
+		// Enrichment only: recordSNI feeds sniStoreLookup's later reads
+		// for the Violation/ObservedDest display fields, and never
+		// anything matchEntry consults -- see the package doc comment.
 		e.recordSNI(ev)
-		e.recheckPendingOnSNI(ev.ContainerID)
 		return nil
 	case observe.Connection:
-		return e.evaluateConnection(ev)
+		if v := e.evaluateConnection(ev); v != nil {
+			return []Violation{*v}
+		}
+		return nil
 	default:
 		return nil
 	}
 }
 
 // Forget releases a container's correlation state: its DNS cache, its SNI
-// window, and any connections still awaiting a deferred verdict (which
-// are dropped outright here, never flushed -- a container being forgotten
-// is gone, so there is nothing left to alert about it). A daemon should
-// call this when the runtime reports a container removed, so long-lived
-// fleets do not accumulate state for containers that no longer exist.
-// Calling it for an unknown or already-forgotten container is a harmless
-// no-op.
+// window, and its observed-egress recorder entries. A daemon should call
+// this when the runtime reports a container removed, so long-lived fleets
+// do not accumulate state for containers that no longer exist. Calling it
+// for an unknown or already-forgotten container is a harmless no-op.
 func (e *Engine) Forget(containerID string) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	delete(e.dns, containerID)
 	delete(e.sni, containerID)
-	delete(e.pending, containerID)
 	delete(e.observed, containerID)
 }
 
@@ -176,7 +195,9 @@ func (e *Engine) recordDNS(ev observe.Event) {
 }
 
 // recordSNI updates the container's recent-SNI window from ev. An event
-// with no SNI name carries nothing to correlate and is ignored.
+// with no SNI name carries nothing to correlate and is ignored. See the
+// package doc comment: this feeds enrichment display only, never a match
+// decision.
 func (e *Engine) recordSNI(ev observe.Event) {
 	if ev.SNIName == "" {
 		return
@@ -201,6 +222,9 @@ func (e *Engine) dnsCacheLookup(containerID string, addr netip.Addr, now time.Ti
 }
 
 // sniStoreLookup is a nil-safe read of one container's recent-SNI window.
+// Its result is enrichment material for a Violation/ObservedDest's display
+// fields ONLY -- see the package doc comment -- never an input to
+// matchEntry.
 func (e *Engine) sniStoreLookup(containerID string, now time.Time) (string, bool) {
 	s := e.sni[containerID]
 	if s == nil {
@@ -212,13 +236,11 @@ func (e *Engine) sniStoreLookup(containerID string, now time.Time) (string, bool
 // evaluateConnection implements the crux of the engine: evaluation of one
 // observed Connection against the container's resolved policy. The
 // lettered steps below match the implementation brief's evaluation order
-// exactly. It returns nil for an allowed or out-of-scope connection, a
-// single immediate Violation for a deny match or an undeferrable
-// default-deny-floor violation, or the result of deferPending (nil, or
-// one violation forced out by a full pending queue) for a deferrable
-// default-deny-floor violation -- see the package doc comment and
-// hasNameBasedAllow.
-func (e *Engine) evaluateConnection(ev observe.Event) []Violation {
+// exactly. It returns nil for an allowed, unarmed, or out-of-scope
+// connection, or a single, final Violation for a deny match or a
+// default-deny-floor violation. See the package doc comment for why SNI
+// never influences this outcome.
+func (e *Engine) evaluateConnection(ev observe.Event) *Violation {
 	// (a) Resolve the container's policy. Unarmed or unknown means
 	// observed but never policy-judged -- the connection may still be
 	// worth recording for the observed-egress recorder below, just never
@@ -253,32 +275,43 @@ func (e *Engine) evaluateConnection(ev observe.Event) []Violation {
 		return nil
 	}
 
-	// (d) Name evidence: DNS cache and recent SNI, SNI wins on
-	// disagreement, both are kept for the violation message.
+	// (d) Name evidence. dnsName/dnsOK is a DNS-cache correlation for this
+	// container's own recent answers: a hard IP-to-name lookup, and the
+	// ONLY name evidence matchEntry ever consults (see the package doc
+	// comment on fail-closed SNI). sniName/sniOK is looked up purely so it
+	// can be carried through as enrichment on the Violation/ObservedDest
+	// this connection produces; it never participates in matching. display
+	// prefers SNI when both exist (it is evidence on the connection
+	// itself, and the more specific of the two for a human reading the
+	// alert), but that preference affects ONLY the human-facing
+	// Destination/ObservedDest.Name label -- never the allow/deny outcome
+	// or the no-match/unresolved-ip classification, both of which are
+	// computed from dnsName/dnsOK alone below.
 	dnsName, dnsOK := e.dnsCacheLookup(ev.ContainerID, dst, ev.Timestamp)
 	sniName, sniOK := e.sniStoreLookup(ev.ContainerID, ev.Timestamp)
-	hasName := dnsOK || sniOK
-	name := dnsName
+	display := dnsName
 	if sniOK {
-		name = sniName
+		display = sniName
 	}
 
 	if !armed {
-		e.recordObserved(ev.ContainerID, ev.ContainerName, dst, ev.DstPort, ev.Proto, name, ev.Timestamp, "observed")
+		e.recordObserved(ev.ContainerID, ev.ContainerName, dst, ev.DstPort, ev.Proto, dnsName, sniName, ev.Timestamp, "observed")
 		return nil
 	}
 
 	// (e) Match against the policy: deny beats allow beats the
-	// default-deny floor. Tokens are resolved against live World data
-	// only when the policy actually references them, since those World
-	// calls may walk the runtime's container list.
+	// default-deny floor. ctx.dnsName/hasDNSName is the ONLY name
+	// evidence a Domain/DomainWildcard entry can match against -- see
+	// match.go and the package doc comment. Tokens are resolved against
+	// live World data only when the policy actually references them,
+	// since those World calls may walk the runtime's container list.
 	needsSelf, needsProject := policyNeedsTokens(pol)
 	ctx := matchContext{
-		dstIP:    dst,
-		dstPort:  ev.DstPort,
-		name:     strings.ToLower(name),
-		hasName:  hasName,
-		networks: nets,
+		dstIP:      dst,
+		dstPort:    ev.DstPort,
+		dnsName:    strings.ToLower(dnsName),
+		hasDNSName: dnsOK,
+		networks:   nets,
 	}
 	if needsSelf {
 		ctx.selfSubnets = selfSubnets(nets, e.world.ContainerNetworks(ev.ContainerID))
@@ -289,58 +322,43 @@ func (e *Engine) evaluateConnection(ev observe.Event) []Violation {
 
 	for _, d := range pol.Deny {
 		if matchEntry(d, ctx) {
-			// Deny is definitive at connect time: never deferred,
-			// regardless of what a later SNI might say.
-			e.recordObserved(ev.ContainerID, ev.ContainerName, dst, ev.DstPort, ev.Proto, name, ev.Timestamp, ClassDeny.String())
-			return []Violation{*e.buildViolation(pol, ev, dst, name, dnsName, sniName, ClassDeny)}
+			e.recordObserved(ev.ContainerID, ev.ContainerName, dst, ev.DstPort, ev.Proto, dnsName, sniName, ev.Timestamp, ClassDeny.String())
+			return e.buildViolation(pol, ev, dst, display, dnsName, sniName, ClassDeny)
 		}
 	}
 	for _, a := range pol.Allow {
 		if matchEntry(a, ctx) {
-			e.recordObserved(ev.ContainerID, ev.ContainerName, dst, ev.DstPort, ev.Proto, name, ev.Timestamp, "allowed")
+			e.recordObserved(ev.ContainerID, ev.ContainerName, dst, ev.DstPort, ev.Proto, dnsName, sniName, ev.Timestamp, "allowed")
 			return nil
 		}
 	}
 
-	// (f) Default-deny floor: unresolved-ip when there was no name
-	// evidence at all, no-match otherwise.
+	// (f) Default-deny floor. The no-match/unresolved-ip split is a
+	// classification of an ALREADY-produced violation, not a match
+	// decision -- it never determines whether this connection is
+	// permitted, only how alarming the resulting alert reads -- so it may
+	// still consider SNI evidence: a connection with SOME name evidence
+	// (DNS or SNI) gives a human something to investigate and is
+	// classified no-match, while a bare IP with neither is the frozen
+	// doc's named exfiltration shape, unresolved-ip.
 	class := ClassNoMatch
-	if !hasName {
+	if !dnsOK && !sniOK {
 		class = ClassUnresolvedIP
 	}
-
-	// Before returning it as an immediate violation, consider deferral:
-	// a late SNI arriving just after this connect can only ever change
-	// this verdict if (1) this container has no SNI evidence for this
-	// connection yet -- if it already does, SNI already won at step (d)
-	// and nothing more can arrive to help -- and (2) the policy actually
-	// has a name-based (Domain or DomainWildcard) allow entry for a late
-	// SNI to satisfy in the first place. A pure-IP-and-token policy can
-	// never be rescued by a name, so it is never worth the delay. Either
-	// way the recorder gets this connection's verdict as of right now:
-	// the class it would carry if a late SNI does not go on to rescue it.
-	// The recorder is a best-effort suggest/status aid, not a security
-	// verdict, so a rare case where a deferred connection is later
-	// rescued into an allow leaves a slightly stale "no-match"/
-	// "unresolved-ip" entry rather than "allowed" -- harmless, since the
-	// destination was reached either way and is exactly what an operator
-	// building an allowlist wants to see.
-	e.recordObserved(ev.ContainerID, ev.ContainerName, dst, ev.DstPort, ev.Proto, name, ev.Timestamp, class.String())
-
-	if !sniOK && hasNameBasedAllow(pol) {
-		return e.deferPending(ev, pol, dst, ctx)
-	}
-
-	return []Violation{*e.buildViolation(pol, ev, dst, name, dnsName, sniName, class)}
+	e.recordObserved(ev.ContainerID, ev.ContainerName, dst, ev.DstPort, ev.Proto, dnsName, sniName, ev.Timestamp, class.String())
+	return e.buildViolation(pol, ev, dst, display, dnsName, sniName, class)
 }
 
 // buildViolation assembles the Violation for a classified connection.
-// destination is the winning name evidence (already resolved by the
-// caller), or the literal destination IP when there was none.
-func (e *Engine) buildViolation(pol policy.Policy, ev observe.Event, dst netip.Addr, name, dnsName, sniName string, class Class) *Violation {
+// destination is the best available evidence for a human-readable label
+// (display, computed by the caller: SNI preferred when present, else DNS,
+// else empty) -- used ONLY for Destination/dedup identity, never for the
+// match decision that already happened. dnsName and sniName are carried
+// through independently as the raw enrichment fields.
+func (e *Engine) buildViolation(pol policy.Policy, ev observe.Event, dst netip.Addr, display, dnsName, sniName string, class Class) *Violation {
 	destination := dst.String()
-	if name != "" {
-		destination = strings.ToLower(name)
+	if display != "" {
+		destination = strings.ToLower(display)
 	}
 	return &Violation{
 		Service:       pol.Name,

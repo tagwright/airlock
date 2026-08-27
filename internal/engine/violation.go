@@ -77,12 +77,17 @@ type Violation struct {
 	// else the container name. This is the first element of Identity.
 	Service string
 
-	// Destination is the best available identity for where the
-	// connection went: the winning name evidence (SNI when both SNI and
-	// DNS exist and disagree, else whichever exists) lowercased, or the
-	// literal destination IP string when there was no name evidence at
-	// all. This is the second element of Identity, and what an alert
-	// reads as "connected to X."
+	// Destination is the best available HUMAN-FACING identity for where
+	// the connection went: SNI when present (it is evidence on the
+	// connection itself, and the more specific of the two for display),
+	// else the DNS-cache name, else the literal destination IP string.
+	// This is purely a display/dedup label -- it is NOT the name evidence
+	// that decided this connection's allow/deny outcome, which is always
+	// the DNS-cache correlation alone (see match.go's fail-closed-on-SNI
+	// doc comment); DNSName/SNIName below carry the two sources
+	// separately for a reader who wants to see exactly what was known.
+	// This is the second element of Identity, and what an alert reads as
+	// "connected to X."
 	Destination string
 
 	// Port is the connection's destination port. Third element of

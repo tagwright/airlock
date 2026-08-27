@@ -18,13 +18,15 @@
 #     a real notification channel (a throwaway ntfy server on the same
 #     network).
 #
-# The three connections are deliberately spaced (SNI_GAP_SECONDS apart,
-# well past the engine's sniWindow) rather than fired back to back: firing
-# them close together is a real, separately-documented correlation risk
-# (see docs/TESTING.md's "SNI correlation can misattribute across close-
-# together connections" finding) that this script deliberately does NOT
-# exercise, to keep this proof about the pipeline working on reality, not
-# about that specific known limitation.
+# The three connections fire back to back with no deliberate spacing. An
+# earlier version of this script spaced them SNI_GAP_SECONDS apart to dodge
+# a real SNI-correlation risk (see docs/TESTING.md's "RESOLVED: SNI
+# correlation could misattribute across close-together connections"
+# finding): airlock has since gone fail-closed on SNI (SNI is enrichment
+# only and never participates in a match decision; only a DNS-cache
+# correlation can satisfy a name rule), which makes that risk moot
+# regardless of connection timing -- firing them close together now is
+# itself part of this proof, not something to avoid.
 #
 # Every Docker object this script creates (containers, the network, the
 # built image) is named/tagged with the prefix "airlock-itest" and is torn
@@ -57,8 +59,7 @@ IMAGE=airlock-itest:latest
 STATE_DIR="$HARNESS_DIR/.detect-state-$$"
 CFG="$HARNESS_DIR/detect.itest.yml"
 
-SNI_GAP_SECONDS=8   # comfortably past the engine's 5s sniWindow
-FLUSH_WAIT_SECONDS=15 # poll ceiling: past both the 5s sniWindow deferral and a state-write cycle
+STATE_WAIT_SECONDS=8 # poll ceiling: comfortably past a state-write cycle (AIRLOCK_STATE_INTERVAL=1s below)
 
 log() { printf '\n=== %s ===\n' "$1"; }
 
@@ -124,22 +125,20 @@ fi
 
 log "connection 1/3: example.com (allowed by policy)"
 docker exec "$TARGET" sh -c 'curl -s -o /dev/null -w "example.com -> %{http_code}\n" --max-time 5 https://example.com'
-sleep "$SNI_GAP_SECONDS"
 
 log "connection 2/3: 1.1.1.1 bare IP (no DNS, no SNI -- expect unresolved-ip)"
 docker exec "$TARGET" sh -c 'curl -s -o /dev/null -w "1.1.1.1 -> %{http_code}\n" --max-time 5 -k https://1.1.1.1'
-sleep "$SNI_GAP_SECONDS"
 
 log "connection 3/3: www.wikipedia.org (has name evidence, not allow-listed -- expect no-match)"
 docker exec "$TARGET" sh -c 'curl -s -o /dev/null -w "wikipedia -> %{http_code}\n" --max-time 5 https://www.wikipedia.org'
 
-log "waiting for the engine's deferred (SNI-window) verdicts to flush and land in state.json"
-echo "(polls state.json up to ${FLUSH_WAIT_SECONDS}s: each deferred verdict needs up to 5s to" \
-     "clear the engine's sniWindow, then up to another state-write interval to reach disk)"
+log "waiting for the daemon's verdicts to land in state.json"
+echo "(polls state.json up to ${STATE_WAIT_SECONDS}s: verdicts are synchronous and final at connect" \
+     "time, so this only needs to cover a state-write cycle, not any correlation window)"
 
 # --- assertions ------------------------------------------------------------
 
-python3 - "$STATE_DIR/state.json" "$FLUSH_WAIT_SECONDS" <<'PYEOF'
+python3 - "$STATE_DIR/state.json" "$STATE_WAIT_SECONDS" <<'PYEOF'
 import json, sys, time
 
 path, timeout_s = sys.argv[1], float(sys.argv[2])

@@ -134,21 +134,30 @@ func TestWildcardDomainDoesNotMatchApex(t *testing.T) {
 	now := time.Now()
 	ip := mustAddr("93.184.216.34")
 	e.Process(dnsEvent("c1", "example.com", 300*time.Second, now, ip))
-	conn := now.Add(time.Second)
 	// The apex resolved but *.example.com must not match it: this falls
-	// through to the default-deny floor. The policy DOES carry a
-	// name-based (wildcard) allow entry and no SNI has been seen for this
-	// connection yet, so per the deferral rule this is held rather than
-	// emitted immediately, in case a late SNI for some subdomain still
-	// arrives. Since no such SNI ever comes, Flush after the deferral
-	// window emits it, and it HAD name evidence throughout, so no-match
-	// rather than unresolved-ip.
-	wantNoViolation(t, e.Process(connEvent("c1", ip, 443, conn)))
-	got := e.Flush(conn.Add(sniWindow + time.Second))
+	// through to the default-deny floor, immediately (evaluation is
+	// synchronous and final at connect time). It HAD DNS name evidence
+	// throughout, so no-match rather than unresolved-ip.
+	got := e.Process(connEvent("c1", ip, 443, now.Add(time.Second)))
 	wantOneViolation(t, got, ClassNoMatch)
 }
 
-func TestAllowedBySNI(t *testing.T) {
+// -- fail-closed on SNI: SNI is enrichment only, never a match input --
+//
+// See engine.go's package doc comment for why: trace_sni carries no
+// destination IP, so it can only be tied to a connection by
+// same-container-plus-timing, and a real integration pass reproduced that
+// timing-only join misattributing one connection's SNI to a different,
+// unrelated connection -- a false negative a security tool must not have.
+// A Domain/DomainWildcard entry, allow or deny alike, now matches ONLY via
+// a DNS-cache correlation.
+
+// TestFailClosedSNIOnlyDoesNotMatchAllow proves the core fix: an SNI name
+// that matches an allow entry does NOT rescue a connection whose
+// destination IP is absent from this container's DNS cache. It also
+// proves SNI is still carried through as enrichment on the resulting
+// Violation.
+func TestFailClosedSNIOnlyDoesNotMatchAllow(t *testing.T) {
 	w := newFakeWorld()
 	w.policies["c1"] = testPolicy("svc", policy.External, policy.Alert, []string{"example.com:443"}, nil)
 	e := New(w)
@@ -157,10 +166,21 @@ func TestAllowedBySNI(t *testing.T) {
 	ip := mustAddr("93.184.216.34")
 	e.Process(sniEvent("c1", "example.com", now))
 	got := e.Process(connEvent("c1", ip, 443, now.Add(time.Second)))
-	wantNoViolation(t, got)
+
+	v := wantOneViolation(t, got, ClassNoMatch)
+	if v.SNIName != "example.com" {
+		t.Errorf("Violation.SNIName = %q, want the observed SNI carried through as enrichment", v.SNIName)
+	}
+	if v.DNSName != "" {
+		t.Errorf("Violation.DNSName = %q, want empty (no DNS answer was ever recorded)", v.DNSName)
+	}
 }
 
-func TestSNIBeatsDNSOnDisagreement(t *testing.T) {
+// TestFailClosedSNIDoesNotOverrideDNSMismatch proves DNS-cache correlation
+// alone decides the match, even when a same-container SNI names a
+// destination that IS on the allowlist: an earlier version of this engine
+// let SNI win on disagreement and would have allowed this connection.
+func TestFailClosedSNIDoesNotOverrideDNSMismatch(t *testing.T) {
 	w := newFakeWorld()
 	w.policies["c1"] = testPolicy("svc", policy.External, policy.Alert, []string{"good.example:443"}, nil)
 	e := New(w)
@@ -168,32 +188,32 @@ func TestSNIBeatsDNSOnDisagreement(t *testing.T) {
 	now := time.Now()
 	ip := mustAddr("198.51.100.9")
 	// DNS says this IP resolved from a name NOT in the allowlist; SNI on
-	// the connection itself says the allowed name. SNI must win.
+	// the connection itself names the allowed host. DNS decides: this is
+	// still a violation.
 	e.Process(dnsEvent("c1", "bad.example", 300*time.Second, now, ip))
 	e.Process(sniEvent("c1", "good.example", now.Add(time.Second)))
 	got := e.Process(connEvent("c1", ip, 443, now.Add(2*time.Second)))
-	wantNoViolation(t, got)
+
+	v := wantOneViolation(t, got, ClassNoMatch)
+	if v.DNSName != "bad.example" || v.SNIName != "good.example" {
+		t.Errorf("evidence fields = dns=%q sni=%q, want both carried through even though only DNS decided the match", v.DNSName, v.SNIName)
+	}
 }
 
-func TestDNSAloneWithDisagreeingNameWouldViolate(t *testing.T) {
-	// Companion to TestSNIBeatsDNSOnDisagreement: without the SNI
-	// evidence, the same DNS answer alone does not satisfy the
-	// allowlist, confirming the prior test exercises a real preference,
-	// not a coincidence. The policy has a name-based allow and no SNI has
-	// been seen yet, so this is deferred rather than emitted immediately
-	// (a late SNI naming "good.example" could still rescue it); since
-	// none ever arrives, it surfaces at Flush.
+// TestDNSCorrelationAllowStillWorks proves the DNS-cache correlation path
+// -- the ONLY name-matching path under fail-closed -- still allows a
+// destination correctly. Companion to TestAllowedByExactDomainAfterDNS,
+// stated explicitly here for the fail-closed proof set.
+func TestDNSCorrelationAllowStillWorks(t *testing.T) {
 	w := newFakeWorld()
 	w.policies["c1"] = testPolicy("svc", policy.External, policy.Alert, []string{"good.example:443"}, nil)
 	e := New(w)
 
 	now := time.Now()
 	ip := mustAddr("198.51.100.9")
-	e.Process(dnsEvent("c1", "bad.example", 300*time.Second, now, ip))
-	conn := now.Add(time.Second)
-	wantNoViolation(t, e.Process(connEvent("c1", ip, 443, conn)))
-	got := e.Flush(conn.Add(sniWindow + time.Second))
-	wantOneViolation(t, got, ClassNoMatch)
+	e.Process(dnsEvent("c1", "good.example", 300*time.Second, now, ip))
+	got := e.Process(connEvent("c1", ip, 443, now.Add(time.Second)))
+	wantNoViolation(t, got)
 }
 
 // -- deny and default-deny --
@@ -211,9 +231,6 @@ func TestDenyBeatsAllow(t *testing.T) {
 }
 
 func TestDefaultDenyNoMatchWithName(t *testing.T) {
-	// "other.example" is a name-based allow entry, so a no-match with no
-	// SNI seen yet is deferred, not immediate; it surfaces at Flush since
-	// no rescuing SNI ever arrives.
 	w := newFakeWorld()
 	w.policies["c1"] = testPolicy("svc", policy.External, policy.Alert, []string{"other.example:443"}, nil)
 	e := New(w)
@@ -221,24 +238,16 @@ func TestDefaultDenyNoMatchWithName(t *testing.T) {
 	now := time.Now()
 	ip := mustAddr("198.51.100.9")
 	e.Process(dnsEvent("c1", "unknown.example", 300*time.Second, now, ip))
-	conn := now.Add(time.Second)
-	wantNoViolation(t, e.Process(connEvent("c1", ip, 443, conn)))
-	got := e.Flush(conn.Add(sniWindow + time.Second))
+	got := e.Process(connEvent("c1", ip, 443, now.Add(time.Second)))
 	wantOneViolation(t, got, ClassNoMatch)
 }
 
 func TestDefaultDenyUnresolvedIPWithNoNameEvidence(t *testing.T) {
-	// Same deferral applies with no name evidence at all: the policy
-	// still carries a name-based allow entry, so the bare-IP connection
-	// is held in case a late SNI names it, and surfaces as
-	// unresolved-ip at Flush when none does.
 	w := newFakeWorld()
 	w.policies["c1"] = testPolicy("svc", policy.External, policy.Alert, []string{"other.example:443"}, nil)
 	e := New(w)
 
-	now := time.Now()
-	wantNoViolation(t, e.Process(connEvent("c1", mustAddr("198.51.100.9"), 443, now)))
-	got := e.Flush(now.Add(sniWindow + time.Second))
+	got := e.Process(connEvent("c1", mustAddr("198.51.100.9"), 443, time.Now()))
 	wantOneViolation(t, got, ClassUnresolvedIP)
 }
 
@@ -357,14 +366,9 @@ func TestAllowedPortDoesNotPermitOtherPort(t *testing.T) {
 	wantNoViolation(t, e.Process(connEvent("c1", ip, 443, now.Add(time.Second))))
 
 	// The port-8080 connection still fails to match (the allow entry is
-	// pinned to 443), but the policy has a name-based allow entry and no
-	// SNI has been seen yet, so the deferral trigger fires even though no
-	// possible SNI could actually rescue a port mismatch -- see
-	// hasNameBasedAllow's doc comment on this deliberately simple,
-	// slightly over-broad trigger. It surfaces at Flush.
-	conn := now.Add(time.Second)
-	wantNoViolation(t, e.Process(connEvent("c1", ip, 8080, conn)))
-	got := e.Flush(conn.Add(sniWindow + time.Second))
+	// pinned to 443), immediately: the same name evidence that matched on
+	// 443 is simply the wrong port here.
+	got := e.Process(connEvent("c1", ip, 8080, now.Add(time.Second)))
 	wantOneViolation(t, got, ClassNoMatch)
 }
 

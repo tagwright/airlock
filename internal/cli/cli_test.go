@@ -207,6 +207,68 @@ func TestSuggest_YAMLBlock(t *testing.T) {
 	}
 }
 
+// TestSuggest_SNIOnlyDestinationSuggestsIPNotDomain proves an observed
+// destination with an SNI name but no DNS-correlated name renders as an
+// ip:port allow entry, never as the SNI name -- a name rule built from an
+// SNI-only observation would never match again under fail-closed matching
+// (see engine.go's package doc comment) -- and that the SNI name still
+// appears as an informational aside on that entry's review note.
+func TestSuggest_SNIOnlyDestinationSuggestsIPNotDomain(t *testing.T) {
+	now := time.Now().UTC()
+	path := fixtureSnapshotWithSNIOnly(t, now)
+
+	out, _, err := runCLI(t, "suggest", "legacy", "--state", path)
+	if err != nil {
+		t.Fatalf("suggest: unexpected error %v\noutput: %s", err, out)
+	}
+
+	if !strings.Contains(out, `airlock.allow: "203.0.113.20:443"`) {
+		t.Errorf("suggest csv line wrong (want the bare IP, never the SNI-only domain), got:\n%s", out)
+	}
+	if strings.Contains(out, "sni-only.example.com:443") {
+		t.Errorf("suggest output must never render an SNI-only name as a suggested entry:\n%s", out)
+	}
+	if !strings.Contains(out, `observed SNI "sni-only.example.com"`) {
+		t.Errorf("suggest output missing the informational SNI aside on the ip-only line:\n%s", out)
+	}
+}
+
+// fixtureSnapshotWithSNIOnly builds a minimal state snapshot with exactly
+// one suggest destination that has an observed SNI name but no
+// DNS-correlated name, for TestSuggest_SNIOnlyDestinationSuggestsIPNotDomain.
+func fixtureSnapshotWithSNIOnly(t *testing.T, now time.Time) string {
+	t.Helper()
+	snap := daemon.StateSnapshot{
+		SchemaVersion: 1,
+		GeneratedAt:   now,
+		Version:       "00.01.00b1",
+		Suggestions: []daemon.SuggestContainer{
+			{
+				ID: "legacy123456", Name: "legacy",
+				Destinations: []daemon.SuggestDest{
+					{
+						Name: "", SNIName: "sni-only.example.com",
+						IP: "203.0.113.20", Port: 443, Proto: "tcp",
+						Count: 3, Verdict: "no-match",
+						FirstSeen: now.Add(-time.Hour), LastSeen: now.Add(-time.Minute),
+					},
+				},
+			},
+		},
+	}
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+	data, err := json.MarshalIndent(snap, "", "  ")
+	if err != nil {
+		t.Fatalf("marshal fixture snapshot: %v", err)
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatalf("write fixture snapshot: %v", err)
+	}
+	return path
+}
+
 // TestSuggest_UnknownContainer proves suggest reports a clear message and
 // a nonzero result for a container with no recorded observations.
 func TestSuggest_UnknownContainer(t *testing.T) {

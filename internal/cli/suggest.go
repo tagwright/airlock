@@ -42,11 +42,16 @@ func newSuggestCmd() *cobra.Command {
 		Short: "Render a container's observed egress as ready-to-paste allow entries",
 		Long: `suggest reads the daemon's state snapshot and renders every distinct
 in-scope destination observed from <container> (matched by name or id) as
-a ready-to-paste airlock.allow value: "name:port" when the engine had name
-evidence (SNI preferred, else DNS) for that destination, else "ip:port".
-Entries with no name evidence are called out separately so the operator
-can review them before trusting them -- see the frozen grammar's honesty
-section on the unresolved-ip shape.
+a ready-to-paste airlock.allow value: "name:port" when the engine had a
+DNS-cache-correlated name for that destination, else "ip:port". A name
+rule only matches again if pasted back in when it came from DNS
+correlation (fail-closed matching never consults SNI, see the engine's
+package doc comment), so an observed SNI name is never rendered as a
+suggested entry's domain -- it is shown only as an informational aside on
+the ip:port line it accompanies, when there is one. Entries with no
+DNS-correlated name are called out separately so the operator can review
+them before trusting them -- see the frozen grammar's honesty section on
+the unresolved-ip shape.
 
 The onboarding workflow this command is built for: set airlock.enable=true
 and airlock.mode=audit with an empty or partial allowlist, let it run for a
@@ -88,6 +93,9 @@ delete the mode label to move the container onto default-deny alert mode.`,
 				note := ""
 				if e.ipOnly {
 					note = "  # NO NAME EVIDENCE -- review before trusting"
+					if e.sniName != "" {
+						note += fmt.Sprintf(" (observed SNI %q, not usable as a name rule under fail-closed matching)", e.sniName)
+					}
 				}
 				fmt.Fprintf(out, "# %-40s %5d conn, last seen %s, verdict=%s%s\n",
 					e.text, e.count, e.lastSeen.UTC().Format(time.RFC3339), e.verdict, note)
@@ -117,7 +125,7 @@ delete the mode label to move the container onto default-deny alert mode.`,
 			}
 			if len(ipOnly) > 0 {
 				fmt.Fprintln(out)
-				fmt.Fprintf(out, "# %d entry(ies) above have no name evidence (bare IP, no DNS or SNI correlation): %s\n",
+				fmt.Fprintf(out, "# %d entry(ies) above have no DNS-correlated name (an observed SNI, shown above when there is one, is informational only and never usable as a name rule under fail-closed matching): %s\n",
 					len(ipOnly), strings.Join(ipOnly, ", "))
 				fmt.Fprintln(out, "# Review each one before trusting it -- see the frozen grammar's unresolved-ip honesty section.")
 			}
@@ -149,8 +157,16 @@ func findSuggestContainer(containers []daemon.SuggestContainer, target string) *
 
 // suggestEntry is one rendered, deduplicated allow-entry candidate.
 type suggestEntry struct {
-	text     string // "name:port" or "ip:port" (IPv6 bracketed), the paste-ready form
-	ipOnly   bool
+	text   string // "name:port" or "ip:port" (IPv6 bracketed), the paste-ready form
+	ipOnly bool
+
+	// sniName is the observed SNI name for this destination, if any,
+	// carried purely as an informational aside for an ipOnly entry's
+	// review note -- see daemon.SuggestDest.SNIName's doc comment. Never
+	// part of text: an SNI-only name would never match again under
+	// fail-closed matching if pasted back in as a domain rule.
+	sniName string
+
 	count    int
 	lastSeen time.Time
 	verdict  string
@@ -160,7 +176,11 @@ type suggestEntry struct {
 // sorted suggestEntry values. Two destinations that render to the same
 // text (e.g. two connections to the same name on the same port, observed
 // under slightly different Proto casing) are merged: counts sum, and
-// lastSeen/verdict take the most recently seen of the two.
+// lastSeen/verdict take the most recently seen of the two. host is always
+// d.Name (the DNS-cache-correlated name) or, when that is empty, the raw
+// IP -- never d.SNIName, since only a DNS-correlated name is guaranteed to
+// match again under fail-closed matching if pasted back in as a rule; see
+// engine.ObservedDest.Name's doc comment.
 func renderSuggestEntries(dests []daemon.SuggestDest) []suggestEntry {
 	byText := make(map[string]*suggestEntry)
 	var order []string
@@ -191,6 +211,9 @@ func renderSuggestEntries(dests []daemon.SuggestDest) []suggestEntry {
 			order = append(order, text)
 		}
 		e.count += d.Count
+		if d.SNIName != "" {
+			e.sniName = d.SNIName
+		}
 		if d.LastSeen.After(e.lastSeen) {
 			e.lastSeen = d.LastSeen
 			e.verdict = d.Verdict

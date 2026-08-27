@@ -18,12 +18,25 @@ type matchContext struct {
 	dstIP   netip.Addr
 	dstPort uint16
 
-	// name is the winning name evidence for this connection (SNI when it
-	// exists, else DNS, per the frozen doc's "SNI wins on disagreement"
-	// rule), lowercased. hasName is false when neither source had
-	// anything, in which case name is always "".
-	name    string
-	hasName bool
+	// dnsName/hasDNSName is the ONLY name evidence a Domain or
+	// DomainWildcard entry may match against: a DNS-cache correlation for
+	// this container's own recent answers (a hard IP-to-name lookup),
+	// lowercased. hasDNSName is false when this container's DNS cache has
+	// no entry for dstIP, in which case dnsName is always "".
+	//
+	// Deliberately NOT influenced by SNI. An earlier version of this
+	// context carried a single "best evidence, SNI preferred on
+	// disagreement" name field consulted here; a real integration pass
+	// reproduced that trace_sni's lack of a destination IP lets one
+	// connection's SNI misattribute to a DIFFERENT, unrelated connection
+	// from the same container fired moments later, which could mark a
+	// disallowed connection allowed -- a false negative a security tool
+	// must not have. SNI is now enrichment-only: still looked up, still
+	// carried through on Violation/ObservedDest for a human to read, but
+	// never passed into this struct or consulted by matchEntry. See
+	// engine.go's package doc comment for the full story.
+	dnsName    string
+	hasDNSName bool
 
 	// selfSubnets and projectPeers resolve @self and @project; both are
 	// left nil when the policy being evaluated uses neither token (see
@@ -40,7 +53,8 @@ type matchContext struct {
 // matchEntry reports whether one parsed policy.Entry matches the
 // connection described by ctx, per the frozen entry grammar (Fork 3) and
 // the group tokens (Fork 8). A port on the entry constrains the match to
-// that destination port; no port means any port.
+// that destination port; no port means any port. Domain/DomainWildcard
+// matching is fail-closed on SNI: see ctx.dnsName's doc comment.
 func matchEntry(e policy.Entry, ctx matchContext) bool {
 	if e.HasPort && e.Port != ctx.dstPort {
 		return false
@@ -53,9 +67,9 @@ func matchEntry(e policy.Entry, ctx matchContext) bool {
 	case policy.CIDR:
 		return e.Prefix.Contains(ctx.dstIP)
 	case policy.Domain:
-		return ctx.hasName && strings.EqualFold(ctx.name, e.Domain)
+		return ctx.hasDNSName && strings.EqualFold(ctx.dnsName, e.Domain)
 	case policy.DomainWildcard:
-		return ctx.hasName && matchWildcardDomain(ctx.name, e.Domain)
+		return ctx.hasDNSName && matchWildcardDomain(ctx.dnsName, e.Domain)
 	case policy.SelfNetworks:
 		return prefixesContain(ctx.selfSubnets, ctx.dstIP)
 	case policy.ProjectPeers:

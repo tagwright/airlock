@@ -42,7 +42,6 @@ func newTestDaemon(t *testing.T, cfg *config.Config, rt *fakeRuntime) *Daemon {
 		violations:        newViolationTally(),
 		unpolicied:        newUnpoliciedTracker(),
 		heartbeatInterval: time.Minute,
-		flushInterval:     100 * time.Millisecond,
 		debounce:          10 * time.Millisecond,
 		resolvConfPath:    "/nonexistent-resolv-conf-for-airlock-tests",
 		statePath:         filepath.Join(t.TempDir(), "state.json"),
@@ -89,20 +88,14 @@ func TestDaemon_ReconcileDropsRemovedContainerAndForgetsEngineState(t *testing.T
 	}
 
 	// The DNS correlation is gone immediately, before any reconcile
-	// runs. c1's policy has a name-based allow entry (example.com), so
-	// the engine defers this would-be violation briefly rather than
-	// surfacing it on Process itself (see engine.Engine.Process's doc
-	// comment); Flush past that deferral window is what surfaces the
-	// final unresolved-ip verdict, proving the DNS cache was actually
-	// cleared rather than merely stale.
-	if v := d.engine.Process(observe.Event{
+	// runs: the same connection now resolves synchronously and finally
+	// to unresolved-ip, proving the DNS cache was actually cleared rather
+	// than merely stale.
+	v := d.engine.Process(observe.Event{
 		Kind: observe.Connection, ContainerID: "c1", DstIP: dst, DstPort: 443, Timestamp: now,
-	}); len(v) != 0 {
-		t.Fatalf("Process(conn) after Forget = %+v, want none yet (deferred)", v)
-	}
-	v := d.engine.Flush(now.Add(6 * time.Second))
+	})
 	if len(v) != 1 || v[0].Class != engine.ClassUnresolvedIP {
-		t.Fatalf("Flush() after Forget = %+v, want one unresolved-ip violation", v)
+		t.Fatalf("Process(conn) after Forget = %+v, want one unresolved-ip violation", v)
 	}
 
 	// And the next reconcile drops c1 from the World snapshot entirely,
@@ -179,21 +172,11 @@ func TestDaemon_HandleObserveEvent_ArmedConnectionRecordsRealVerdict(t *testing.
 	}
 }
 
-// TestRecordAndAlertViolation_TalliesRegardlessOfSource pins the fix this
-// integration pass made: BOTH of Run's Violation sources -- Process's
-// immediate verdicts (handleObserveEvent) and Flush's deferred ones (the
-// flush case in Run's select loop) -- must tally into d.violations, since
-// `airlock status`'s per-container violation counts read that tally, not
-// the alerter. Before recordAndAlertViolation existed as a shared choke
-// point, Run's flush case alerted a deferred Violation without ever
-// tallying it: confirmed live, a real deferred connection (the common
-// case, since deferral applies to any policy with a domain-based allow
-// entry) alerted correctly but never appeared in state.json's
-// violations_by_class. This test calls recordAndAlertViolation directly
-// -- the same method both Run call sites now use -- so a regression that
-// reintroduces two independent, drifting call sites would still be caught
-// here as long as both keep routing through it.
-func TestRecordAndAlertViolation_TalliesRegardlessOfSource(t *testing.T) {
+// TestRecordAndAlertViolation_Tallies proves recordAndAlertViolation -- the
+// single choke point handleObserveEvent routes every synchronous verdict
+// through -- tallies each call into d.violations, since `airlock status`'s
+// per-container violation counts read that tally, not the alerter.
+func TestRecordAndAlertViolation_Tallies(t *testing.T) {
 	cfg := newTestConfig(t)
 	d := newTestDaemon(t, cfg, &fakeRuntime{})
 	ctx := context.Background()
@@ -207,13 +190,12 @@ func TestRecordAndAlertViolation_TalliesRegardlessOfSource(t *testing.T) {
 		Timestamp:   time.Now(),
 	}
 
-	for _, source := range []string{"process", "flush"} {
-		d.recordAndAlertViolation(ctx, v, source)
-	}
+	d.recordAndAlertViolation(ctx, v)
+	d.recordAndAlertViolation(ctx, v)
 
 	tally := d.violations.Snapshot()
 	if got := tally["c1"]["unresolved-ip"]; got != 2 {
-		t.Fatalf("violations tally for c1/unresolved-ip = %d, want 2 (one per recordAndAlertViolation call, regardless of source label)", got)
+		t.Fatalf("violations tally for c1/unresolved-ip = %d, want 2 (one per recordAndAlertViolation call)", got)
 	}
 }
 

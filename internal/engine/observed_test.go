@@ -197,3 +197,33 @@ func TestObserved_LoopbackAndOwnNetworkNotRecorded(t *testing.T) {
 		t.Errorf("Observed(c1) after loopback connection = %+v, want none recorded", got)
 	}
 }
+
+// TestObserved_SNIOnlyPopulatesSNINameNotName proves ObservedDest.Name is
+// DNS-correlation-only: an observed SNI with no DNS answer at all lands in
+// SNIName, never in Name, so a `airlock suggest` caller rendering Name as
+// a paste-ready domain never emits a rule that could not actually match
+// under fail-closed matching (see engine.go's package doc comment).
+func TestObserved_SNIOnlyPopulatesSNINameNotName(t *testing.T) {
+	w := newFakeWorld()
+	e := New(w) // c1 unarmed: recorded verdict is "observed".
+	now := time.Now()
+	dst := mustAddr("203.0.113.10")
+
+	e.Process(sniEvent("c1", "sni-only.example.com", now))
+	e.Process(observe.Event{
+		Kind: observe.Connection, ContainerID: "c1", ContainerName: "x",
+		DstIP: dst, DstPort: 443, Proto: "tcp", Timestamp: now.Add(time.Second),
+	})
+
+	got := e.Observed("c1")
+	if len(got) != 1 {
+		t.Fatalf("Observed(c1) = %+v, want exactly one entry", got)
+	}
+	d := got[0]
+	if d.Name != "" {
+		t.Errorf("Name = %q, want empty (no DNS answer was ever recorded)", d.Name)
+	}
+	if d.SNIName != "sni-only.example.com" {
+		t.Errorf("SNIName = %q, want the observed SNI name", d.SNIName)
+	}
+}

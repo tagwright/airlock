@@ -32,13 +32,27 @@ type ObservedDest struct {
 	Port  uint16
 	Proto string
 
-	// Name is the best name evidence available at observation time: the
-	// recent SNI when there was one (SNI preferred, per the frozen doc's
-	// "SNI wins on disagreement" rule), else the DNS-cache name for this
-	// IP, else empty when there was no name evidence at all. Empty means
-	// exactly what the frozen doc calls the unresolved-ip shape: a bare IP
-	// with nothing to name it.
+	// Name is the DNS-cache-correlated name for this destination, or empty
+	// when this container's DNS cache holds nothing for it. This is
+	// deliberately the SAME name evidence the policy engine itself will
+	// match a Domain/DomainWildcard entry against (see match.go's
+	// fail-closed-on-SNI doc comment): `airlock suggest` renders Name
+	// straight into a "name:port" allow entry precisely because, unlike an
+	// SNI-only name, it is guaranteed to actually match if pasted back in.
+	// Empty means the frozen doc's unresolved-ip shape as far as a
+	// PASTEABLE name rule is concerned, even if SNIName below is
+	// non-empty.
 	Name string
+
+	// SNIName is the observed TLS SNI name for this destination, if any,
+	// carried purely as informational enrichment -- exactly like
+	// Violation.SNIName. It is NEVER the right value to render as a
+	// suggested allow entry's domain: a name rule built from an SNI-only
+	// observation would never match again under fail-closed matching (see
+	// engine.go's package doc comment), so a caller building suggest
+	// output should render Name if non-empty, else the destination IP,
+	// and may show SNIName only as an informational aside on the IP line.
+	SNIName string
 
 	FirstSeen time.Time
 	LastSeen  time.Time
@@ -47,11 +61,10 @@ type ObservedDest struct {
 	// Verdict is "observed" for a connection recorded from an unarmed (or
 	// unknown-to-World) container -- this container's declared policy, if
 	// any, was never evaluated against this connection -- or, for an armed
-	// container, the actual outcome: "allowed" or a Class.String() value
-	// (the connection's classification at the moment it was recorded,
-	// which for a deferred default-deny-floor verdict is the class it
-	// would carry if a late SNI does not go on to rescue it; see
-	// evaluateConnection).
+	// container, the actual, final outcome: "allowed" or a Class.String()
+	// value. Evaluation is synchronous and final at connect time (see
+	// evaluateConnection), so this is never a placeholder for a verdict
+	// that might still change.
 	Verdict string
 }
 
@@ -65,7 +78,8 @@ type observedEntry struct {
 	dstIP         netip.Addr
 	port          uint16
 	proto         string
-	name          string
+	name          string // DNS-cache-correlated name only; see ObservedDest.Name
+	sniName       string // informational enrichment only; see ObservedDest.SNIName
 	firstSeen     time.Time
 	lastSeen      time.Time
 	count         int
@@ -97,8 +111,10 @@ func observedKey(dst netip.Addr, port uint16, proto string) string {
 // Caller must hold e.mu -- see the Engine.observed field's doc comment.
 // This is always true in practice: the only caller is evaluateConnection,
 // itself only ever reached from Process, which takes e.mu for its entire
-// body.
-func (e *Engine) recordObserved(containerID, containerName string, dst netip.Addr, port uint16, proto, name string, when time.Time, verdict string) {
+// body. dnsName and sniName are recorded independently, per
+// ObservedDest.Name/SNIName's doc comments -- dnsName is the only one
+// `airlock suggest` may ever render as a suggested entry's domain.
+func (e *Engine) recordObserved(containerID, containerName string, dst netip.Addr, port uint16, proto, dnsName, sniName string, when time.Time, verdict string) {
 	if containerID == "" {
 		return
 	}
@@ -125,11 +141,15 @@ func (e *Engine) recordObserved(containerID, containerName string, dst netip.Add
 	entry.lastSeen = when
 	entry.verdict = verdict
 	// Only overwrite name evidence when this observation actually carries
-	// some: a later connection to the same destination with no name
-	// evidence (a stale DNS cache entry, no SNI this time) should not blank
-	// out a good name a human would want to see on the suggested line.
-	if name != "" {
-		entry.name = name
+	// some, independently for each source: a later connection to the same
+	// destination with no name evidence this time (a stale DNS cache
+	// entry, no SNI this time) should not blank out a good name a human
+	// would want to see on the suggested/displayed line.
+	if dnsName != "" {
+		entry.name = dnsName
+	}
+	if sniName != "" {
+		entry.sniName = sniName
 	}
 }
 
@@ -160,6 +180,7 @@ func snapshotObservedContainerLocked(oc *observedContainer) []ObservedDest {
 			Port:          entry.port,
 			Proto:         entry.proto,
 			Name:          entry.name,
+			SNIName:       entry.sniName,
 			FirstSeen:     entry.firstSeen,
 			LastSeen:      entry.lastSeen,
 			Count:         entry.count,

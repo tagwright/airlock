@@ -91,10 +91,6 @@ func TestLoadStateSnapshot_MissingFile(t *testing.T) {
 // tested, job).
 func TestBuildStateSnapshot_ArmedAndSuggestData(t *testing.T) {
 	cfg := newTestConfig(t)
-	// A CIDR-only allow (no name-based entry) so a bare-IP connection
-	// resolves immediately as a violation rather than being deferred for
-	// a possible late-SNI rescue (see engine.hasNameBasedAllow) -- this
-	// test wants an immediate, tallied violation.
 	armed := armedContainer("c1", "web", map[string]string{"airlock.allow": "10.0.0.0/8"})
 	unarmed := runtime.Container{ID: "c2", Name: "legacy", Labels: map[string]string{}}
 	rt := &fakeRuntime{containers: []runtime.Container{armed, unarmed}}

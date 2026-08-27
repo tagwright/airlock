@@ -15,8 +15,8 @@
 // # Concurrency
 //
 // Exactly one goroutine -- the one running Daemon.Run's select loop --
-// ever calls engine.Process, engine.Flush, or reconcile (which mutates
-// the World snapshot those two read). This is the architecture's
+// ever calls engine.Process or reconcile (which mutates the World
+// snapshot both read). This is the architecture's
 // documented "simplest correct design": no snapshot lock is needed
 // because there is never a second goroutine touching it. Every
 // timer/source that runs on its own goroutine is explicitly documented,
@@ -77,12 +77,6 @@ const (
 	// brief asked to make tunable.
 	reconcileDebounce = 2 * time.Second
 
-	// flushInterval is how often Daemon.Run calls engine.Flush to
-	// surface deferred verdicts. The engine's own doc comment
-	// recommends "a few hundred milliseconds ... comfortably finer than
-	// sniWindow"; this picks the middle of that range.
-	flushInterval = 300 * time.Millisecond
-
 	// defaultHeartbeatInterval is how often Daemon.Run pushes a healthy
 	// alert.Report for the Gatus dead-man's-switch leg, absent
 	// AIRLOCK_HEARTBEAT_INTERVAL. JUDGMENT CALL: not specified by the
@@ -134,7 +128,6 @@ type Daemon struct {
 	selfID string
 
 	heartbeatInterval time.Duration
-	flushInterval     time.Duration
 	debounce          time.Duration
 	resolvConfPath    string
 	statePath         string
@@ -186,7 +179,6 @@ func New(ctx context.Context, cfg *config.Config, logger *slog.Logger) (*Daemon,
 		violations:        newViolationTally(),
 		unpolicied:        newUnpoliciedTracker(),
 		heartbeatInterval: heartbeatInterval(),
-		flushInterval:     flushInterval,
 		debounce:          reconcileDebounce,
 		resolvConfPath:    resolvConfPath(),
 		statePath:         StatePath(),
@@ -413,9 +405,6 @@ func (d *Daemon) Run(ctx context.Context) error {
 	heartbeat := time.NewTicker(d.heartbeatInterval)
 	defer heartbeat.Stop()
 
-	flush := time.NewTicker(d.flushInterval)
-	defer flush.Stop()
-
 	debounceTimer := time.NewTimer(d.debounce)
 	if !debounceTimer.Stop() {
 		<-debounceTimer.C
@@ -503,11 +492,6 @@ func (d *Daemon) Run(ctx context.Context) error {
 				d.logger.Error("daemon: reconcile failed", "error", err)
 			}
 
-		case now := <-flush.C:
-			for _, v := range d.engine.Flush(now) {
-				d.recordAndAlertViolation(ctx, v, "flush")
-			}
-
 		case <-heartbeat.C:
 			if err := d.alerter.Report(ctx, true); err != nil {
 				d.logger.Error("daemon: heartbeat report", "error", err)
@@ -517,7 +501,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 }
 
 // handleObserveEvent feeds one observe.Event through the engine and routes
-// any resulting Violations to the alerter, tallying each by container and
+// any resulting Violation to the alerter, tallying it by container and
 // class along the way (violationTally, see tally.go) for `airlock
 // status`'s per-container violation counts. It also stamps the backend
 // health tracker's last-event time, since an event actually reaching this
@@ -526,39 +510,29 @@ func (d *Daemon) Run(ctx context.Context) error {
 // records unpolicied and suggest data directly inside Process/
 // evaluateConnection, so there is nothing left for this method to do for
 // an unarmed container's connection beyond what Process already did.
-// Called only from Run's own goroutine.
+//
+// engine.Process now always returns a Connection's FINAL verdict
+// synchronously (fail-closed on SNI removed the deferred-verdict/Flush
+// path that used to be this method's only other Violation source), so
+// this is the single place a Violation ever reaches the alerter. Called
+// only from Run's own goroutine.
 func (d *Daemon) handleObserveEvent(ctx context.Context, ev observe.Event) {
 	d.health.RecordEvent(time.Now())
 
 	for _, v := range d.engine.Process(ev) {
-		d.recordAndAlertViolation(ctx, v, "process")
+		d.recordAndAlertViolation(ctx, v)
 	}
 }
 
-// recordAndAlertViolation tallies v by container and class
-// (violationTally, see tally.go -- the source for `airlock status`'s
-// per-container violation counts) and routes it through the alerter. It
-// is the single choke point both of Run's two Violation sources funnel
-// through: handleObserveEvent, for engine.Process's immediate verdicts,
-// and Run's flush case, for engine.Flush's deferred ones.
-//
-// BUG FIX (this integration pass): before this helper existed, Run's
-// flush case alerted a deferred Violation without ever tallying it, so
-// `airlock status`'s per-container violation counts silently
-// undercounted -- often all the way to zero -- every violation that went
-// through the deferred/SNI-window path. That path is not a rare corner:
-// deferral is gated only on the policy having ANY domain-based allow
-// entry (hasNameBasedAllow), so it is the common case for a realistic
-// policy, not an edge case. Confirmed live against a real daemon: a
-// connection with no name evidence at all (always deferred, since any
-// name-based allow entry qualifies for deferral) alerted correctly but
-// never appeared in state.json's violations_by_class until this fix.
-// sourceLabel distinguishes the two call sites in the error log only; it
-// has no bearing on tallying or alerting.
-func (d *Daemon) recordAndAlertViolation(ctx context.Context, v engine.Violation, sourceLabel string) {
+// recordAndAlertViolation tallies v by container and class (violationTally,
+// see tally.go -- the source for `airlock status`'s per-container
+// violation counts) and routes it through the alerter, so the two can
+// never drift apart into a violation that alerts but is not tallied (or
+// vice versa).
+func (d *Daemon) recordAndAlertViolation(ctx context.Context, v engine.Violation) {
 	d.violations.Record(v.ContainerID, v.Class.String())
 	if err := d.alerter.Violation(ctx, v); err != nil {
-		d.logger.Error("daemon: alert violation", "source", sourceLabel, "error", err)
+		d.logger.Error("daemon: alert violation", "error", err)
 	}
 }
 

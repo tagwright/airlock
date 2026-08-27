@@ -807,6 +807,12 @@ func destinationLabel(v engine.Violation) string {
 // destination ... port, class, container name/id, and both DNS and SNI
 // evidence when present" requirement. sinceLastAlert is 0 for a first-hit
 // alert, and the suppressed-repeat count for a window-rolled re-alert.
+//
+// DNSName/SNIName are shown purely as evidence for a human: matching is
+// fail-closed on SNI (see internal/engine's package doc comment), so a
+// disagreement between the two never means "SNI overrode DNS" -- it means
+// DNS alone decided this verdict, and SNI is shown alongside only because
+// it is additional context a human investigating the alert may want.
 func violationNotification(v engine.Violation, sinceLastAlert int) beacon.Notification {
 	dest := destinationLabel(v)
 
@@ -830,7 +836,7 @@ func violationNotification(v engine.Violation, sinceLastAlert int) beacon.Notifi
 			fmt.Fprintf(&body, " sni=%s", v.SNIName)
 		}
 		if v.DNSName != "" && v.SNIName != "" && !strings.EqualFold(v.DNSName, v.SNIName) {
-			body.WriteString(" (disagree: SNI wins for matching)")
+			body.WriteString(" (disagree: DNS decided the match, SNI is informational only)")
 		}
 	}
 

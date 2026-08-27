@@ -203,6 +203,14 @@ extracting the tally-then-alert sequence into
 (`handleObserveEvent` and the `flush` case) through it, so they cannot
 drift apart again silently.
 
+UPDATE (fail-closed-on-SNI pass): the deferral mechanism this bug lived in
+(`pending.go`, `engine.Flush`, `Run`'s `flush` case) has since been
+removed entirely -- see "RESOLVED" below -- so there is no longer a second
+call site for `recordAndAlertViolation` to guard against drifting from.
+The helper itself is kept (now with a single caller,
+`handleObserveEvent`) purely so tallying and alerting can never drift
+apart if a second call site is ever added again.
+
 ## A documentation-only bug, found while wiring a real alert channel
 
 Standing up a real ntfy channel for the detect-and-alert proof below
@@ -223,15 +231,23 @@ example was checked too and was already correct.)
 `test/integration/run-detect.sh` builds the real image, runs the real
 daemon `--privileged` against the real Docker socket with a real `ig`,
 labels a throwaway target container `airlock.enable=true
-airlock.allow=example.com:443`, and drives three real connections,
-deliberately spaced 8 seconds apart (see the SNI-correlation finding
-below for exactly why they are not fired back to back):
+airlock.allow=example.com:443`, and drives three real connections.
+
+HISTORICAL NOTE: at the time of this run, the engine still let SNI win a
+match on disagreement with DNS and deliberately spaced the three
+connections 8 seconds apart to dodge the correlation risk documented
+below (which this very run's evidence field incidentally illustrates).
+Both of those things are gone: matching is now fail-closed on DNS-cache
+correlation only (see "RESOLVED" below), and the script fires all three
+connections back to back. The table is kept as the historical record of
+what this pass proved; a reader should not infer "SNI wins on
+disagreement" is still true.
 
 | Connection | Name evidence | Expected verdict | Confirmed |
 |---|---|---|---|
 | `https://example.com` | Real DNS answer + real SNI ClientHello, both `example.com` | allowed, **no violation** | Yes -- zero violations attributed to it; the only two violations tallied are the other two connections below |
 | `https://1.1.1.1` (bare IP) | None -- curl sends no SNI for a literal IP host, and no DNS lookup happens for one | `unresolved-ip` | Yes -- `violations_by_class.unresolved-ip == 1`, and a real log line + real ntfy message with the right container/service/destination/class |
-| `https://www.wikipedia.org` | Real DNS + real SNI, both `www.wikipedia.org`, not allow-listed | `no-match` | Yes -- `violations_by_class.no-match == 1`, and a real log line + real ntfy message; the log's evidence field also proves the DNS/SNI disagreement-resolution rule ("SNI wins on disagreement") firing on real data (`dns=www.wikipedia.org.` vs `sni=www.wikipedia.org`, the trailing-dot difference being exactly why DNS and SNI evidence for the same real name "disagree" byte-for-byte) |
+| `https://www.wikipedia.org` | Real DNS + real SNI, both `www.wikipedia.org`, not allow-listed | `no-match` | Yes -- `violations_by_class.no-match == 1`, and a real log line + real ntfy message; the log's evidence field also showed real DNS/SNI disagreement on the same name (`dns=www.wikipedia.org.` vs `sni=www.wikipedia.org`, a trailing-dot difference) -- under the matching rule of the time this meant "SNI wins," now it means only that DNS decided the match and SNI is shown alongside as enrichment |
 
 `state.json`'s `backend.events_flowing` was `true` throughout, and the
 same run's `suggestions` (the `airlock suggest` data source) correctly
@@ -246,29 +262,31 @@ violation lines), and once through a real, throwaway `binwiederhier/ntfy`
 server on the same Docker network, with both real messages confirmed via
 ntfy's own JSON poll API, correct title/body/priority/tags included.
 
-### A note on `suggestions` staleness (not a bug)
+### A note on `suggestions` staleness (historical, no longer applicable)
 
-The `example.com` connection is deferred at connect time (its own SNI
-has not arrived yet) and correctly resolved to "allowed" moments later
-once the real SNI event lands -- confirmed by zero violations ever being
-tallied for it. But the *`airlock suggest` recorder's* entry for that
-same destination still shows `"verdict": "no-match"`, the verdict it
-would have carried had the later SNI never rescued it. This is
-`evaluateConnection`'s own documented behavior (see its comment on
-`recordObserved`): the recorder is a best-effort suggest/status aid, not
-the security verdict, and a rescued deferred connection deliberately
-leaves a stale entry there rather than being updated after the fact.
-Confirmed harmless: the real, security-relevant verdict (whether a
-Violation is ever tallied or alerted) is correct; only the informational
-suggest-list entry lags.
+At the time this was written, the `example.com` connection was deferred
+at connect time (its own SNI had not arrived yet) and correctly resolved
+to "allowed" moments later once the real SNI event landed -- confirmed by
+zero violations ever being tallied for it. But the *`airlock suggest`
+recorder's* entry for that same destination still showed
+`"verdict": "no-match"`, the verdict it would have carried had the later
+SNI never rescued it, a deliberate, documented limitation of the
+deferred-verdict design of that time.
 
-## A real, reproduced correlation risk -- not fixed, needs a design decision
+**This entire code path no longer exists.** The deferral mechanism
+(`pending.go`, `Engine.Flush`) that made a "rescued" verdict possible was
+removed as part of the fail-closed-on-SNI fix below: every verdict is now
+decided synchronously and finally at connect time, so there is no
+"deferred-then-rescued" state left to go stale in `suggestions`. Kept here
+for the historical record of what this integration pass observed.
+
+## RESOLVED: SNI correlation could misattribute across close-together connections
 
 Firing all three connections **close together** (a fraction of a second
 apart, as a first, naive version of this harness did) reproducibly
-misattributes SNI evidence across unrelated connections from the same
+misattributed SNI evidence across unrelated connections from the same
 container, with a real security consequence: **a genuinely disallowed
-connection can be classified as allowed.**
+connection could be classified as allowed.**
 
 Mechanism, confirmed by direct inspection of the resulting `state.json`
 and cross-referenced against the real captured NDJSON timestamps:
@@ -277,42 +295,50 @@ and cross-referenced against the real captured NDJSON timestamps:
 a connection's own timestamp within `sniWindow` (5s) -- by design, and
 covered by an existing unit test
 (`TestSNIStorePicksClosestOnMultipleRecent`) that pins exactly this
-"closest wins" behavior. Nothing marks a record "consumed" once it
-resolves one connection, so the *same* SNI observation can be matched to
-a *second*, unrelated connection that never had any SNI evidence of its
-own. In the reproduced case: `example.com`'s SNI (recorded first) was
+"closest wins" behavior. Nothing marked a record "consumed" once it
+resolved one connection, so the *same* SNI observation could be matched
+to a *second*, unrelated connection that never had any SNI evidence of
+its own. In the reproduced case: `example.com`'s SNI (recorded first) was
 still the closest entry in the store when the very next connection (to
-`1.1.1.1`, which sends no SNI at all) was evaluated moments later --
-`evaluateConnection`'s initial synchronous check found `sniOK == true`
-using someone else's name, skipped deferral entirely (deferral only
-triggers `if !sniOK`), and immediately, definitively classified the
-`1.1.1.1` connection as **allowed**. The same thing happened to the
-`www.wikipedia.org` connection in the three-way race. Both are immediate,
-final verdicts -- not the merely-cosmetic `suggestions`-staleness case
-documented above -- so this is a real false negative a security tool
-must not have, not a display quirk.
+`1.1.1.1`, which sends no SNI at all) was evaluated moments later, and
+was found allowed using someone else's name. The same thing happened to
+the `www.wikipedia.org` connection in the three-way race. Both were
+immediate, final verdicts -- a real false negative a security tool must
+not have, not a display quirk.
 
-This is **not** being mechanically patched in this pass. The engine's own
-package doc is explicit that `trace_sni` carries no destination IP at all
-and correlation is deliberately "same-container plus temporal proximity"
-as a *documented, tested* approximation, not an oversight -- fixing the
-double-use specifically (e.g. consume-once semantics) touches
-security-critical, already-unit-tested correlation logic
-(`sni.go`/`pending.go`) shared by every deferred-verdict code path, and
-deserves the same kind of deliberate design call this suite's own history
-gives this class of problem (see e.g. ballast's `Splay` field, left
-undecided for a full pass before being resolved), not a rushed change
-under an integration pass's time box. **Recommendation for a dedicated
-follow-up:** decide whether SNI records should be single-use once they
-resolve a connection's verdict, whether the window should be direction-
-aware (only accept an SNI recorded no earlier than the connection itself,
-since a ClientHello cannot precede its own TCP connect), or whether the
-risk is accepted and should instead be stated plainly in
-user-facing docs as a known limitation of any container making several
-concurrent/rapid TLS connections. `run-detect.sh` deliberately spaces its
-three connections 8 seconds apart specifically to avoid tripping this,
-so it does not regress silently if a future fix changes the behavior;
-a dedicated reproduction lives in this section for whoever picks it up.
+**Nate's ratified design decision: fail-closed on SNI.** SNI no longer
+participates in ANY match decision, allow or deny. A Domain/DomainWildcard
+entry now matches a connection ONLY via a DNS-cache correlation for that
+container's own recent answers -- a hard IP-to-name lookup, with no timing
+or cross-connection ambiguity possible, since DNS precedes the connect and
+is looked up by the connection's own destination IP, not by proximity.
+`sniStore` and the `TLSHello` observation path still exist and still
+matter, but purely as enrichment: the observed SNI name, when there is
+one, is carried through on `engine.Violation` (`DNSName`/`SNIName`) and
+`engine.ObservedDest` (`Name`/`SNIName`) for a human reading an alert or a
+suggest line, and can never change a verdict in either direction. See
+`internal/engine/engine.go`'s package doc comment for the full rationale
+and `internal/engine/match.go`'s `matchContext.dnsName` doc comment for
+the mechanics.
+
+One consequence: since DNS-based name matching is already available at
+connect time (DNS precedes the connect), there was no longer anything for
+a "wait briefly for a late SNI" deferral to accomplish. The deferred-
+verdict machinery this section's mechanism analysis above referenced
+(`pending.go`, `Engine.Flush`, the daemon's flush ticker) was removed
+entirely: `engine.Process` now returns a Connection's final verdict
+synchronously, always. `run-detect.sh` no longer needs to space its three
+connections 8 seconds apart to dodge this risk -- fail-closed matching
+makes the close-together case behave identically to the spaced-out case,
+so the script now fires them back to back and that is itself part of the
+proof this is fixed.
+
+Covered by `internal/engine`'s unit tests
+(`TestFailClosedSNIOnlyDoesNotMatchAllow`,
+`TestFailClosedSNIDoesNotOverrideDNSMismatch`,
+`TestDNSCorrelationAllowStillWorks`), and by
+`test/integration/run-detect.sh`'s connections now firing without the
+former spacing workaround.
 
 ## Coverage matrix
 
@@ -323,25 +349,22 @@ a dedicated reproduction lives in this section for whoever picks it up.
 | Real `ig run` invocation (image ref, flags, socket) | **Integration-proven** | Three real bugs found and fixed (runtime default, `--auto-mount-filesystems`, missing `runc`); confirmed working fleet-wide (no `--containername`) against a genuinely busy real host afterward. |
 | Fleet-wide (unscoped) observation on a busy host | **Integration-proven** | `run-detect.sh`'s `suggestions` output recorded real egress from multiple unrelated real production containers during the same run. |
 | DNS-based allow correlation | **Integration-proven** | `example.com`: real DNS answer, real SNI, resolved to allowed, zero violations. |
-| SNI-based allow correlation | **Integration-proven** | Same connection; the daemon's own log line shows SNI winning the disagreement rule against DNS's trailing-dot-qualified name. |
+| SNI-based allow correlation | **Superseded, historical only** | At the time of this run SNI could win a match on disagreement with DNS; that path no longer exists (see "RESOLVED" above) -- SNI is enrichment-only now, and matching is DNS-cache correlation alone. |
 | `unresolved-ip` classification | **Integration-proven** | `1.1.1.1`: real bare-IP connection, no name evidence, correctly classified, tallied, alerted, and delivered to a real ntfy server. |
 | `no-match` classification | **Integration-proven** | `www.wikipedia.org`: real name evidence, not allow-listed, correctly classified, tallied, alerted, delivered. |
 | `deny` classification | **Not exercised this pass** | No deny rule in this pass's policy fixture; the class is well covered at the unit level (`engine_test.go`'s `TestDenyBeatsAllow` and others) but never driven by a real deny-matching connection here. Natural next `run-detect.sh` addition. |
-| Deferred-violation tallying (`state.json`) | **Integration-proven, and a real bug fixed** | See "A fourth real bug" above. |
+| Violation tallying (`state.json`) | **Integration-proven, and a real bug fixed** | See "A fourth real bug" above. The original bug was specific to the (now-removed) deferred/flush path; tallying is unit-tested end to end on the current synchronous path (`daemon_test.go`'s `TestRecordAndAlertViolation_Tallies`). |
 | Real alert delivery, log channel | **Integration-proven** | Every `run-detect.sh` run's daemon log. |
 | Real alert delivery, ntfy | **Integration-proven** | `run-detect.sh`'s ntfy assertion, via ntfy's own JSON poll API. |
 | Real alert delivery, discord/smtp/webhook | **Not yet tested** | Same boundary ballast documents for its own notification backends: these live in `github.com/tagwright/beacon` and need a live external endpoint/account this repo-local harness doesn't have. |
 | Gatus telemetry sink | **Not yet tested** | No itest configures `telemetry`; needs a real Gatus push-URL target. |
-| SNI correlation across close-together connections | **Reproduced live, NOT fixed** | See the dedicated section above. A real, security-relevant finding for a maintainer decision, not a bug this pass patched. |
+| SNI correlation across close-together connections | **RESOLVED (fail-closed on SNI)** | See the dedicated section above. Nate ratified fail-closed on SNI as the fix; the deferral machinery this risk depended on is removed entirely. `run-detect.sh` now fires its three connections back to back rather than spaced, as part of the proof. |
 | Podman backend, IG-side | **Not yet tested** | This pass only exercised the Docker runtime end to end. `internal/daemon`'s `resolvedRuntimeName`/`observeRuntimes` fix is unit-tested (`TestObserveRuntimes_TracksAirlockRuntime`) for the `AIRLOCK_RUNTIME=podman` case, but no itest here stands up a real Podman socket the way `ballast`'s `run-podman.sh` does. |
 | Digest pinning (`Options.Images`) | **Not exercised** | Every capture/detect run in this pass used `:latest` gadget images (this pass's own default). Digest pinning is a packaging-time decision documented as a TODO in `internal/observe/ig`'s package doc; not itself a behavior this harness can meaningfully test differently. |
 | `groups`/`@self`/`scope`/flood/audit modes | **Out of scope for this pass** | Per the phase plan: later integration passes. |
 
 ## What remains for later integration passes
 
-- **The SNI cross-connection correlation risk** above needs a design
-  decision before (or alongside) a fix -- the highest-priority item this
-  pass surfaces.
 - **A real `deny` rule** driven end to end (currently only unit-tested).
 - **Podman**, end to end, the way this pass did Docker: a real Podman
   socket, `AIRLOCK_RUNTIME=podman`, confirming `observeRuntimes` actually

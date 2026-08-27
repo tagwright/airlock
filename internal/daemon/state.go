@@ -133,7 +133,18 @@ type SuggestContainer struct {
 // SuggestDest is one observed destination, populated straight from
 // engine.ObservedDest.
 type SuggestDest struct {
-	Name      string    `json:"name,omitempty"`
+	// Name is the DNS-cache-correlated name, or empty when this
+	// container's DNS cache holds nothing for this destination. This is
+	// the only name evidence the CLI's suggest command may render as a
+	// suggested allow entry's domain -- see engine.ObservedDest.Name's doc
+	// comment for why: under fail-closed matching, only a DNS-correlated
+	// name is guaranteed to match again if pasted back in.
+	Name string `json:"name,omitempty"`
+
+	// SNIName is the observed TLS SNI name, if any, carried purely as
+	// informational enrichment -- see engine.ObservedDest.SNIName. Never
+	// the right value to render as a suggested entry's domain.
+	SNIName   string    `json:"sni,omitempty"`
 	IP        string    `json:"ip"`
 	Port      uint16    `json:"port"`
 	Proto     string    `json:"proto"`
@@ -198,7 +209,7 @@ func LoadStateSnapshot(path string) (*StateSnapshot, error) {
 // per reconcile by the main goroutine and read here with no lock at all).
 // It never touches d.world directly -- see world.go's "deliberately NOT
 // safe for concurrent access" contract -- and never calls into
-// d.engine.Process/Flush.
+// d.engine.Process.
 func (d *Daemon) runStateWriter(ctx context.Context) {
 	d.writeStateSnapshot()
 
@@ -276,6 +287,7 @@ func (d *Daemon) buildStateSnapshot() StateSnapshot {
 			}
 			out = append(out, SuggestDest{
 				Name:      dst.Name,
+				SNIName:   dst.SNIName,
 				IP:        dst.DstIP.String(),
 				Port:      dst.Port,
 				Proto:     dst.Proto,

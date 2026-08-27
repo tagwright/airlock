@@ -20,7 +20,7 @@ import (
 //
 // Concurrency: world is deliberately NOT safe for concurrent access. The
 // daemon's single event-loop goroutine is the only caller of both the
-// engine's Process/Flush (which read a world through the engine.World
+// engine's Process (which reads a world through the engine.World
 // interface) and reconcile (which rewrites one via replace), so there is
 // never a second goroutine touching these fields. This is the "simplest
 // correct design" the architecture calls for: no RWMutex, no atomic
