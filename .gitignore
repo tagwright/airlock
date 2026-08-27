@@ -1,0 +1,16 @@
+# Build output
+/airlock
+/dist/
+*.exe
+*.test
+*.out
+*.prof
+
+# Local dev
+.env
+*.local
+
+# Never commit decrypted secrets or a live secrets dir
+*.sops.decrypted
+/run/
+/secrets/
