@@ -374,6 +374,29 @@ func TestDeclaredButUnarmedWarning(t *testing.T) {
 		}
 	})
 
+	t.Run("name only, no enable, no warning", func(t *testing.T) {
+		// name is pure identity metadata, not a policy declaration: a
+		// container that sets only airlock.name while unarmed makes no
+		// claim about its egress and must draw no diagnostics at all.
+		lp, diags := ReadLabels(map[string]string{"airlock.name": "renovate"})
+		if lp.Skipped {
+			t.Fatalf("name-only labels must not skip, diags=%v", diags)
+		}
+		if len(diags) != 0 {
+			t.Errorf("name alone is not a policy declaration, want no diagnostics, got %v", diags)
+		}
+	})
+
+	t.Run("name plus alias name only, no enable, no warning", func(t *testing.T) {
+		lp, diags := ReadLabels(map[string]string{"tagwright.egress.name": "renovate"})
+		if lp.Skipped {
+			t.Fatalf("name-only labels via the alias must not skip, diags=%v", diags)
+		}
+		if len(diags) != 0 {
+			t.Errorf("name alone is not a policy declaration, want no diagnostics, got %v", diags)
+		}
+	})
+
 	t.Run("armed, no warning", func(t *testing.T) {
 		_, diags := ReadLabels(map[string]string{"airlock.enable": "true", "airlock.allow": "example.com:443"})
 		if hasLevel(diags, Warning) {

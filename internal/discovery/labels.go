@@ -42,8 +42,11 @@ var knownSuffixes = map[string]bool{
 // without airlock.enable=true (or, later, a matching armed group) is the
 // sticky "declared but unarmed" warning the grammar mandates. "enable"
 // itself is deliberately excluded: it is the gate, not a declaration.
+// "name" is likewise excluded: it is pure identity metadata (the stable
+// service name used in alerts and dedup), not a policy declaration, so a
+// container that sets only airlock.name while unarmed makes no claim
+// about its egress at all and must not draw the unarmed warning.
 var policyBearingSuffixes = map[string]bool{
-	"name":         true,
 	"mode":         true,
 	"scope":        true,
 	"policy":       true,
