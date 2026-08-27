@@ -1,0 +1,6 @@
+.git
+/airlock
+/dist
+*.test
+*.out
+*.prof
