@@ -134,10 +134,17 @@ func TestWildcardDomainDoesNotMatchApex(t *testing.T) {
 	now := time.Now()
 	ip := mustAddr("93.184.216.34")
 	e.Process(dnsEvent("c1", "example.com", 300*time.Second, now, ip))
-	got := e.Process(connEvent("c1", ip, 443, now.Add(time.Second)))
+	conn := now.Add(time.Second)
 	// The apex resolved but *.example.com must not match it: this falls
-	// through to the default-deny floor, and it HAD name evidence, so
-	// no-match rather than unresolved-ip.
+	// through to the default-deny floor. The policy DOES carry a
+	// name-based (wildcard) allow entry and no SNI has been seen for this
+	// connection yet, so per the deferral rule this is held rather than
+	// emitted immediately, in case a late SNI for some subdomain still
+	// arrives. Since no such SNI ever comes, Flush after the deferral
+	// window emits it, and it HAD name evidence throughout, so no-match
+	// rather than unresolved-ip.
+	wantNoViolation(t, e.Process(connEvent("c1", ip, 443, conn)))
+	got := e.Flush(conn.Add(sniWindow + time.Second))
 	wantOneViolation(t, got, ClassNoMatch)
 }
 
@@ -172,7 +179,10 @@ func TestDNSAloneWithDisagreeingNameWouldViolate(t *testing.T) {
 	// Companion to TestSNIBeatsDNSOnDisagreement: without the SNI
 	// evidence, the same DNS answer alone does not satisfy the
 	// allowlist, confirming the prior test exercises a real preference,
-	// not a coincidence.
+	// not a coincidence. The policy has a name-based allow and no SNI has
+	// been seen yet, so this is deferred rather than emitted immediately
+	// (a late SNI naming "good.example" could still rescue it); since
+	// none ever arrives, it surfaces at Flush.
 	w := newFakeWorld()
 	w.policies["c1"] = testPolicy("svc", policy.External, policy.Alert, []string{"good.example:443"}, nil)
 	e := New(w)
@@ -180,7 +190,9 @@ func TestDNSAloneWithDisagreeingNameWouldViolate(t *testing.T) {
 	now := time.Now()
 	ip := mustAddr("198.51.100.9")
 	e.Process(dnsEvent("c1", "bad.example", 300*time.Second, now, ip))
-	got := e.Process(connEvent("c1", ip, 443, now.Add(time.Second)))
+	conn := now.Add(time.Second)
+	wantNoViolation(t, e.Process(connEvent("c1", ip, 443, conn)))
+	got := e.Flush(conn.Add(sniWindow + time.Second))
 	wantOneViolation(t, got, ClassNoMatch)
 }
 
@@ -199,6 +211,9 @@ func TestDenyBeatsAllow(t *testing.T) {
 }
 
 func TestDefaultDenyNoMatchWithName(t *testing.T) {
+	// "other.example" is a name-based allow entry, so a no-match with no
+	// SNI seen yet is deferred, not immediate; it surfaces at Flush since
+	// no rescuing SNI ever arrives.
 	w := newFakeWorld()
 	w.policies["c1"] = testPolicy("svc", policy.External, policy.Alert, []string{"other.example:443"}, nil)
 	e := New(w)
@@ -206,16 +221,24 @@ func TestDefaultDenyNoMatchWithName(t *testing.T) {
 	now := time.Now()
 	ip := mustAddr("198.51.100.9")
 	e.Process(dnsEvent("c1", "unknown.example", 300*time.Second, now, ip))
-	got := e.Process(connEvent("c1", ip, 443, now.Add(time.Second)))
+	conn := now.Add(time.Second)
+	wantNoViolation(t, e.Process(connEvent("c1", ip, 443, conn)))
+	got := e.Flush(conn.Add(sniWindow + time.Second))
 	wantOneViolation(t, got, ClassNoMatch)
 }
 
 func TestDefaultDenyUnresolvedIPWithNoNameEvidence(t *testing.T) {
+	// Same deferral applies with no name evidence at all: the policy
+	// still carries a name-based allow entry, so the bare-IP connection
+	// is held in case a late SNI names it, and surfaces as
+	// unresolved-ip at Flush when none does.
 	w := newFakeWorld()
 	w.policies["c1"] = testPolicy("svc", policy.External, policy.Alert, []string{"other.example:443"}, nil)
 	e := New(w)
 
-	got := e.Process(connEvent("c1", mustAddr("198.51.100.9"), 443, time.Now()))
+	now := time.Now()
+	wantNoViolation(t, e.Process(connEvent("c1", mustAddr("198.51.100.9"), 443, now)))
+	got := e.Flush(now.Add(sniWindow + time.Second))
 	wantOneViolation(t, got, ClassUnresolvedIP)
 }
 
@@ -332,7 +355,16 @@ func TestAllowedPortDoesNotPermitOtherPort(t *testing.T) {
 	e.Process(dnsEvent("c1", "host.example", 300*time.Second, now, ip))
 
 	wantNoViolation(t, e.Process(connEvent("c1", ip, 443, now.Add(time.Second))))
-	got := e.Process(connEvent("c1", ip, 8080, now.Add(time.Second)))
+
+	// The port-8080 connection still fails to match (the allow entry is
+	// pinned to 443), but the policy has a name-based allow entry and no
+	// SNI has been seen yet, so the deferral trigger fires even though no
+	// possible SNI could actually rescue a port mismatch -- see
+	// hasNameBasedAllow's doc comment on this deliberately simple,
+	// slightly over-broad trigger. It surfaces at Flush.
+	conn := now.Add(time.Second)
+	wantNoViolation(t, e.Process(connEvent("c1", ip, 8080, conn)))
+	got := e.Flush(conn.Add(sniWindow + time.Second))
 	wantOneViolation(t, got, ClassNoMatch)
 }
 

@@ -35,13 +35,20 @@
 // expected to serialize its observation stream before handing events to
 // the engine, since evaluation order matters (a DNSAnswer or TLSHello must
 // be processed before the Connection it is meant to inform, or it simply
-// arrives too late to help that one connection, which is a known
-// correlation limitation, not a bug -- see the implementation report's
-// note on SNI ordering). Process still takes an internal lock so that a
-// second goroutine may safely call an exported read method (for example a
-// future status/suggest snapshot) concurrently with the single feeder
-// goroutine; that lock is not a substitute for feeding events out of order
-// and expecting correct correlation.
+// arrives too late to help that one connection, which is the ordinary
+// case for SNI: a TLS ClientHello is emitted after the TCP connect it
+// rides on, so it usually reaches Process strictly after the Connection
+// event it should inform). pending.go's deferred verdicts exist
+// specifically to absorb that ordinary case for the one situation it can
+// change an answer: a would-be default-deny-floor violation against a
+// policy with a name-based allow entry is held briefly (see sniWindow) so
+// a same-container SNI that lands just after the connect can still
+// resolve it. Process still takes an internal lock so that a second
+// goroutine may safely call Flush, or a future status/suggest snapshot,
+// concurrently with the single feeder goroutine; that lock is not a
+// substitute for feeding events out of order and expecting correct
+// correlation, and it is not a substitute for actually calling Flush --
+// see Flush's doc comment.
 package engine
 
 import (
@@ -59,28 +66,40 @@ import (
 type Engine struct {
 	world World
 
-	mu  sync.Mutex
-	dns map[string]*dnsCache
-	sni map[string]*sniStore
+	mu      sync.Mutex
+	dns     map[string]*dnsCache
+	sni     map[string]*sniStore
+	pending map[string][]*pendingConn
 }
 
 // New constructs an Engine reading live state from world.
 func New(world World) *Engine {
 	return &Engine{
-		world: world,
-		dns:   make(map[string]*dnsCache),
-		sni:   make(map[string]*sniStore),
+		world:   world,
+		dns:     make(map[string]*dnsCache),
+		sni:     make(map[string]*sniStore),
+		pending: make(map[string][]*pendingConn),
 	}
 }
 
 // Process consumes one normalized observation and returns the Violations
-// it produced: none for a DNSAnswer or TLSHello (they only update
-// correlation state), and zero or one for a Connection (evaluation is at
-// connect time only, per the frozen doc, so a Connection is judged exactly
-// once, here). An event of an unrecognized Kind is ignored.
+// it produced immediately: none for a DNSAnswer (it only updates
+// correlation state); none for a TLSHello beyond what it drops from
+// pending (it updates the SNI store and may clear a deferred verdict, but
+// never itself returns a violation); and for a Connection, zero, one, or
+// -- only when a full pending queue forces an unrelated earlier
+// connection out early, see deferPending -- two: the triggering
+// connection's own immediate verdict (deny, an immediate default-deny
+// floor violation, or none if allowed or deferred) plus, rarely, the
+// forced-out one. Evaluation of a Connection is still at connect time
+// only in the sense that it is judged exactly once here or, for the
+// narrow deferred case, once more at Flush; it is never re-judged twice
+// with two different outcomes. An event of an unrecognized Kind is
+// ignored.
 //
 // See the package doc comment for the single-feeder-goroutine assumption
-// this method relies on for correlation ordering.
+// this method relies on for correlation ordering, and Flush's doc comment
+// for what makes a deferred verdict actually surface.
 func (e *Engine) Process(ev observe.Event) []Violation {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -91,27 +110,29 @@ func (e *Engine) Process(ev observe.Event) []Violation {
 		return nil
 	case observe.TLSHello:
 		e.recordSNI(ev)
+		e.recheckPendingOnSNI(ev.ContainerID)
 		return nil
 	case observe.Connection:
-		if v := e.evaluateConnection(ev); v != nil {
-			return []Violation{*v}
-		}
-		return nil
+		return e.evaluateConnection(ev)
 	default:
 		return nil
 	}
 }
 
-// Forget releases a container's correlation state (its DNS cache and SNI
-// window). A daemon should call this when the runtime reports a container
-// removed, so long-lived fleets do not accumulate state for containers
-// that no longer exist. Calling it for an unknown or already-forgotten
-// container is a harmless no-op.
+// Forget releases a container's correlation state: its DNS cache, its SNI
+// window, and any connections still awaiting a deferred verdict (which
+// are dropped outright here, never flushed -- a container being forgotten
+// is gone, so there is nothing left to alert about it). A daemon should
+// call this when the runtime reports a container removed, so long-lived
+// fleets do not accumulate state for containers that no longer exist.
+// Calling it for an unknown or already-forgotten container is a harmless
+// no-op.
 func (e *Engine) Forget(containerID string) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	delete(e.dns, containerID)
 	delete(e.sni, containerID)
+	delete(e.pending, containerID)
 }
 
 // recordDNS updates the answering container's DNS cache from ev. Answers
@@ -174,8 +195,13 @@ func (e *Engine) sniStoreLookup(containerID string, now time.Time) (string, bool
 // evaluateConnection implements the crux of the engine: evaluation of one
 // observed Connection against the container's resolved policy. The
 // lettered steps below match the implementation brief's evaluation order
-// exactly.
-func (e *Engine) evaluateConnection(ev observe.Event) *Violation {
+// exactly. It returns nil for an allowed or out-of-scope connection, a
+// single immediate Violation for a deny match or an undeferrable
+// default-deny-floor violation, or the result of deferPending (nil, or
+// one violation forced out by a full pending queue) for a deferrable
+// default-deny-floor violation -- see the package doc comment and
+// hasNameBasedAllow.
+func (e *Engine) evaluateConnection(ev observe.Event) []Violation {
 	// (a) Resolve the container's policy. Unarmed or unknown means
 	// observed but never policy-judged.
 	pol, armed := e.world.ResolvedPolicy(ev.ContainerID)
@@ -234,7 +260,9 @@ func (e *Engine) evaluateConnection(ev observe.Event) *Violation {
 
 	for _, d := range pol.Deny {
 		if matchEntry(d, ctx) {
-			return e.buildViolation(pol, ev, dst, name, dnsName, sniName, ClassDeny)
+			// Deny is definitive at connect time: never deferred,
+			// regardless of what a later SNI might say.
+			return []Violation{*e.buildViolation(pol, ev, dst, name, dnsName, sniName, ClassDeny)}
 		}
 	}
 	for _, a := range pol.Allow {
@@ -245,11 +273,24 @@ func (e *Engine) evaluateConnection(ev observe.Event) *Violation {
 
 	// (f) Default-deny floor: unresolved-ip when there was no name
 	// evidence at all, no-match otherwise.
+	//
+	// Before returning it as an immediate violation, consider deferral:
+	// a late SNI arriving just after this connect can only ever change
+	// this verdict if (1) this container has no SNI evidence for this
+	// connection yet -- if it already does, SNI already won at step (d)
+	// and nothing more can arrive to help -- and (2) the policy actually
+	// has a name-based (Domain or DomainWildcard) allow entry for a late
+	// SNI to satisfy in the first place. A pure-IP-and-token policy can
+	// never be rescued by a name, so it is never worth the delay.
+	if !sniOK && hasNameBasedAllow(pol) {
+		return e.deferPending(ev, pol, dst, ctx)
+	}
+
 	class := ClassNoMatch
 	if !hasName {
 		class = ClassUnresolvedIP
 	}
-	return e.buildViolation(pol, ev, dst, name, dnsName, sniName, class)
+	return []Violation{*e.buildViolation(pol, ev, dst, name, dnsName, sniName, class)}
 }
 
 // buildViolation assembles the Violation for a classified connection.

@@ -95,3 +95,25 @@ func policyNeedsTokens(pol policy.Policy) (needsSelf, needsProject bool) {
 	}
 	return
 }
+
+// hasNameBasedAllow reports whether pol's Allow list contains at least
+// one Domain or DomainWildcard entry. This is the trigger condition for
+// deferring a default-deny-floor verdict (pending.go's deferPending): a
+// late SNI can only ever rescue a connection into an allow if some name
+// rule exists for it to satisfy. It deliberately does not check whether
+// a candidate entry's port would even match this connection's -- keeping
+// the trigger a simple "does the policy have any name-based allow at
+// all" question, rather than trying to predict whether a specific future
+// SNI could satisfy a specific entry, is the "keep it tight, don't
+// over-engineer" tradeoff: at most it defers a handful of connections
+// that a late SNI could never actually rescue (a name-based allow entry
+// exists but pinned to a different port), for at most sniWindow, which
+// costs a small delay, never a wrong verdict.
+func hasNameBasedAllow(pol policy.Policy) bool {
+	for _, a := range pol.Allow {
+		if a.Kind == policy.Domain || a.Kind == policy.DomainWildcard {
+			return true
+		}
+	}
+	return false
+}
