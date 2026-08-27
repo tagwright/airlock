@@ -4,8 +4,9 @@
 // policy sets a container's airlock.policy label references (Fork 5), the
 // group-scoped policies that arm a whole class of containers without a
 // per-container label (Fork 8), the fleet-wide defaults that mirror the
-// AIRLOCK_* environment globals, and the (not yet wired up) notification
-// and observation-backend sections.
+// AIRLOCK_* environment globals, the notification and telemetry channels
+// internal/alert builds a beacon notifier from, and the (not yet wired up)
+// observation-backend section.
 //
 // The file is optional. The surviving AIRLOCK_* environment variables
 // overlay onto it -- env wins over the file -- so env-only operation with
@@ -62,12 +63,21 @@ type Config struct {
 	// Notifications is airlock's alert-channel configuration for
 	// delivery through beacon (the digest, sticky validation-error
 	// reports, and flood-breaker summaries).
-	//
-	// TODO(alert chunk): this section is parsed and given light
-	// structural validation here only. Turning it into an actual beacon
-	// notifier is a later chunk's job; nothing here constructs or
-	// contacts beacon.
 	Notifications Notifications `yaml:"notifications,omitempty"`
+
+	// Telemetry is the list of health/status push sinks (e.g. a Gatus
+	// external endpoint), separate from the alert channels above. It
+	// mirrors ballast's and bilgeline's Config.Telemetry field-for-field.
+	Telemetry []TelemetryConfig `yaml:"telemetry,omitempty"`
+
+	// SecretsDir is the directory internal/alert's secret resolver reads
+	// named-secret files from, for the credentials Notifications and
+	// Telemetry settings name (never hold literally). Overridable by
+	// AIRLOCK_SECRETS_DIR. Defaults to secret.DefaultSecretsDir when
+	// unset. This is airlock's OWN alerting-secrets directory: it has
+	// nothing to do with any credential a container's own workload
+	// might use, and nothing here is ever a container label.
+	SecretsDir string `yaml:"secrets_dir,omitempty"`
 
 	// Observe is the observation backend's configuration, mirroring
 	// internal/observe/ig.Options field-for-field where practical (ig
@@ -161,10 +171,13 @@ type Defaults struct {
 // concern: delivery through the beacon notifier that runs inside the
 // daemon's own process.
 //
-// TODO(alert chunk): only Type is validated here (must be non-empty). The
-// valid backend-type enum lives with whichever chunk actually wires up
-// beacon and knows which backends it registers; hardcoding that list here
-// ahead of that wiring would risk drifting out of sync with it.
+// This shape is FINAL as of the alert chunk (internal/alert.New consumes
+// it directly): only Type is structurally validated here (must be
+// non-empty). The valid backend-type enum is beacon's own registry
+// (internal/alert imports the beacon package, which self-registers every
+// backend it ships via init()), so hardcoding that list here would risk
+// drifting out of sync with it; an unknown Type surfaces as an error from
+// beacon.New instead, at alert-construction time.
 type Notifications struct {
 	Channels []NotificationChannel `yaml:"channels,omitempty"`
 }
@@ -172,16 +185,44 @@ type Notifications struct {
 // NotificationChannel is one alert channel airlock reports through.
 type NotificationChannel struct {
 	// Type selects the backend, e.g. "ntfy", "discord", "smtp",
-	// "webhook". Required.
+	// "webhook". Required. Passed straight through to
+	// beacon.ChannelConfig.Type.
 	Type string `yaml:"type"`
 
+	// Name is an optional human label for this channel, distinct from
+	// Type, so a fleet with two channels of the same Type (say, two ntfy
+	// topics) can still be told apart in airlock's own error messages
+	// and logs. It plays no role in beacon itself (beacon.ChannelConfig
+	// has no name field); it defaults to Type when empty.
+	Name string `yaml:"name,omitempty"`
+
 	// MinLevel is the minimum severity this channel fires on. Empty
-	// means "receive everything".
+	// means "receive everything". Passed through parseLevel to a
+	// beacon.Level.
 	MinLevel string `yaml:"min_level,omitempty"`
 
-	// Settings carries backend-specific config. Credential values are
-	// secret NAMES resolved at send time, never literal tokens, per the
-	// suite-wide secrets rule.
+	// Settings carries backend-specific config, passed straight through
+	// to beacon.ChannelConfig.Settings. Credential values are secret
+	// NAMES resolved at send time by the backend itself (via the
+	// resolver internal/alert builds from SecretsDir), never literal
+	// tokens, per the suite-wide secrets rule -- this grammar has no
+	// separate "secret ref" field because beacon's own contract is that
+	// ANY settings value naming a secret is resolved this way; which
+	// keys are secret names is a property of the backend, not of this
+	// struct.
+	Settings map[string]string `yaml:"settings,omitempty"`
+}
+
+// TelemetryConfig is one telemetry sink airlock pushes health/status to
+// (e.g. a Gatus external endpoint for the dead-man's-switch heartbeat).
+// Mirrors NotificationChannel's non-import, secret-naming shape and
+// ballast's/bilgeline's TelemetryConfig field-for-field.
+type TelemetryConfig struct {
+	// Type selects the sink, e.g. "gatus". Required.
+	Type string `yaml:"type"`
+
+	// Settings carries sink-specific config. Values that are secrets are
+	// named, never literal, same rule as NotificationChannel.Settings.
 	Settings map[string]string `yaml:"settings,omitempty"`
 }
 
@@ -233,6 +274,14 @@ const (
 	defaultAlertWindow    = "1h"
 	defaultAlertFlood     = 30
 	defaultDigestSchedule = "0 0 * * *"
+
+	// defaultSecretsDir mirrors ballast's and bilgeline's
+	// /run/<tool>/secrets convention: a tmpfs mount the operator drops
+	// alerting-credential files into (e.g. via SOPS at deploy time).
+	// internal/secret.DefaultSecretsDir carries this same value; it is
+	// restated here rather than imported so internal/config does not
+	// need to depend on internal/secret just for one constant.
+	defaultSecretsDir = "/run/airlock/secrets"
 )
 
 // noneSentinel is the reserved "explicitly nothing" value, shared by
@@ -306,6 +355,9 @@ func overlayEnv(cfg *Config) {
 	if v, ok := os.LookupEnv("AIRLOCK_UNPOLICIED_DIGEST"); ok {
 		cfg.Defaults.UnpoliciedDigest = strings.EqualFold(strings.TrimSpace(v), "true")
 	}
+	if v, ok := os.LookupEnv("AIRLOCK_SECRETS_DIR"); ok {
+		cfg.SecretsDir = v
+	}
 }
 
 // parseEntryListEnv parses an AIRLOCK_IMPLICIT_ALLOW-shaped env value: the
@@ -338,6 +390,9 @@ func applyDefaults(cfg *Config) {
 	}
 	if cfg.Defaults.DigestSchedule == "" {
 		cfg.Defaults.DigestSchedule = defaultDigestSchedule
+	}
+	if cfg.SecretsDir == "" {
+		cfg.SecretsDir = defaultSecretsDir
 	}
 }
 
@@ -389,6 +444,12 @@ func (c *Config) Validate() error {
 	for i, ch := range c.Notifications.Channels {
 		if ch.Type == "" {
 			errs = append(errs, fmt.Errorf("notifications.channels[%d]: missing type", i))
+		}
+	}
+
+	for i, t := range c.Telemetry {
+		if t.Type == "" {
+			errs = append(errs, fmt.Errorf("telemetry[%d]: missing type", i))
 		}
 	}
 
