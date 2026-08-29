@@ -1,59 +1,25 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 #
-# Build context note (read before you build):
+# Build from the airlock repository root (single context):
 #
-# airlock's go.mod carries `replace github.com/tagwright/core => ../core`
-# because core is not published yet (airlock requires core v0.3.0, still
-# unreleased). The build therefore needs BOTH the core/ and airlock/ module
-# trees in the build context, so the context is the PARENT directory that
-# holds them as siblings, not the airlock/ directory itself:
+#   docker build -t ghcr.io/tagwright/airlock:dev .
 #
-#   docker build -f airlock/Dockerfile -t ghcr.io/tagwright/airlock:dev .
-#
-# run from the parent of core/ and airlock/ (the tagwright monorepo root, or
-# a clean checkout with both repos cloned as siblings). CI cannot do this
-# yet at all -- see .github/workflows/ci.yml and release.yml's own notes.
-#
-# On a large working tree where core/ and airlock/ are not the only things
-# under that parent (this deployment's actual /mnt/md0/docker is a
-# multi-terabyte tree of unrelated projects), do NOT hand Docker that whole
-# directory as the build context -- it tars the entire tree before the
-# daemon ever reads a .dockerignore rule, .dockerignore or not. Build from a
-# virtual context piped over stdin instead, which only tars the two
-# directories actually named:
-#
-#   tar -cf - -C /mnt/md0/docker core airlock \
-#     | docker build -f airlock/Dockerfile -t ghcr.io/tagwright/airlock:dev -
-#
-# beacon is a different story: it is published and public
-# (github.com/tagwright/beacon), so it is fetched over the network like any
-# other module. GOPRIVATE points go at tagwright's own source for direct
-# fetches rather than the public proxy. go.sum still verifies integrity.
-#
-# ONCE core is published and tagged, this simplifies to a single-context
-# build, exactly like bilgeline did after core was published: drop the
-# `replace` line from go.mod, drop the core COPY below, set the context back
-# to airlock/, and restore the ballast-style `COPY go.mod go.sum ./ && go mod
-# download && COPY .` layering for a better dependency cache.
+# core and beacon are consumed as published modules
+# (github.com/tagwright/core, github.com/tagwright/beacon). GOPRIVATE makes
+# the build fetch tagwright's own modules directly from their source rather
+# than through the public module proxy. go.sum still verifies their integrity.
 
 FROM golang:1.25 AS build
 
-# Fetch tagwright's own modules (beacon) directly from source, not the proxy.
+# Fetch tagwright's own modules (core, beacon) directly from source, not the
+# proxy.
 ENV GOPRIVATE=github.com/tagwright/*
 ENV GOFLAGS=-buildvcs=false
 
 WORKDIR /src
-
-# core/ must sit beside airlock/ so the `replace => ../core` resolves. Copy
-# core first: it changes far less often than airlock, so it caches well.
-COPY core/ ./core/
-COPY airlock/ ./airlock/
-
-WORKDIR /src/airlock
-
-# Download the network deps (beacon and the transitive set) up front. core is
-# a local replace, so nothing is fetched for it.
+COPY go.mod go.sum ./
 RUN go mod download
+COPY . .
 
 # Static, VCS-stamp-free build. The version is stamped from the VERSION file
 # into main.version, matching what `airlock version` prints.
