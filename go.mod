@@ -46,7 +46,3 @@ require (
 	golang.org/x/text v0.41.0 // indirect
 	google.golang.org/protobuf v1.36.12 // indirect
 )
-
-// DEV-ONLY: points at the local sibling checkout of the not-yet-published
-// github.com/tagwright/core module. Dropped before this repo is pushed.
-replace github.com/tagwright/core => ../core

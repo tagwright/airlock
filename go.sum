@@ -73,6 +73,8 @@ github.com/stretchr/testify v1.12.1 h1:EuwCh5fleGS7H32xRwO3wRGT7DxrDhLAT6FF8MpWD
 github.com/stretchr/testify v1.12.1/go.mod h1:MDEgiDPPsNp5cuIrHPPCyornHKgEVbtFUmoNlxoYthg=
 github.com/tagwright/beacon v0.1.0 h1:3JAvyP171lEDFY9Jmy9d7/+HB6bD+/TfEnkCk4mtiDY=
 github.com/tagwright/beacon v0.1.0/go.mod h1:htgrlL7PnSP+Qb2E9vWmlhXtQWzug0TJqK1xdTQvYds=
+github.com/tagwright/core v0.3.0 h1:BMxM4tO4SrWaM/OO0vMTjOelSOWEM5UUy7yMf+zO+Mo=
+github.com/tagwright/core v0.3.0/go.mod h1:Mzubxzwa1ioL6osKIcMVTUKCuI7jRxgFLBPkUNurass=
 github.com/wneessen/go-mail v0.6.2 h1:c6V7c8D2mz868z9WJ+8zDKtUyLfZ1++uAZmo2GRFji8=
 github.com/wneessen/go-mail v0.6.2/go.mod h1:L/PYjPK3/2ZlNb2/FjEBIn9n1rUWjW+Toy531oVmeb4=
 github.com/yuin/goldmark v1.4.13/go.mod h1:6yULJ656Px+3vBD8DxQVa3kxgyrAnzto9xy5taEt/CY=
