@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 techgaud
 
 // Package resolve is the merge heart of airlock: it takes one container's
 // own declared label policy (internal/discovery), the airlock.yml groups

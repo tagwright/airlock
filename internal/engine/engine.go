@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 techgaud
 
 // Package engine is airlock's policy-evaluation engine: the security-
 // critical core that turns the normalized observation stream

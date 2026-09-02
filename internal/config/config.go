@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 techgaud
 
 // Package config loads airlock's configuration from airlock.yml: the named
 // policy sets a container's airlock.policy label references (Fork 5), the

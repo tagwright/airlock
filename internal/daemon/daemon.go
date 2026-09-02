@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 techgaud
 
 // Package daemon is airlock's wiring hub: the long-running process that
 // turns every other package (internal/observe, internal/engine,

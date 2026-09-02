@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 techgaud
 
 // Package policy defines airlock's core policy vocabulary: the destination
 // entry grammar shared by allow/deny lists everywhere they appear (labels,

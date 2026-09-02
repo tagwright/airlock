@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 techgaud
 
 // Package discovery turns one container's labels into a validated,
 // per-container declaration of its egress policy: the dual-doorway label

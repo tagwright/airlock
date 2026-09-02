@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 techgaud
 
 // Package observe defines a backend-neutral model for observing container
 // egress activity: outbound connections, DNS answers, and TLS ClientHello

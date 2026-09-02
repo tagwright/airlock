@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 techgaud
 
 // Package alert turns engine violations and discovery diagnostics into
 // notifications delivered through the beacon library, implementing the

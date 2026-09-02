@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 techgaud
 
 // Package cli builds airlock's Cobra command tree and is the CLI's only
 // entry point: cmd/airlock/main.go calls Execute and does nothing else.
