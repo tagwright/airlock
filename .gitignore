@@ -19,3 +19,10 @@
 # are committed, per-run captures/state are throwaway.
 /test/integration/.capture-*/
 /test/integration/.detect-state-*/
+
+# Project knowledge (CLAUDE.md, CHARTER.md) is versioned centrally in the internal
+# projects-docs repo, not in this codebase repo. The files stay on disk so the
+# CLAUDE cascade still resolves. docs/ is intentionally NOT ignored: it is
+# user-facing documentation that stays public in this FOSS repo.
+/CLAUDE.md
+/CHARTER.md
