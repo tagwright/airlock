@@ -24,9 +24,9 @@ import (
 // coordinates) and a real alert.Alerter wired only to beacon's built-in
 // "log" backend, so Violation/Diagnostic/Digest/Report are safe to call
 // with no network I/O.
-func newTestDaemon(t *testing.T, cfg *config.Config, rt *fakeRuntime) *Daemon {
+func newTestDaemon(t *testing.T, cfg *config.Config, rt *fakeRuntime, alertOpts ...alert.Option) *Daemon {
 	t.Helper()
-	alerter, err := alert.New(cfg, nil)
+	alerter, err := alert.New(cfg, nil, alertOpts...)
 	if err != nil {
 		t.Fatalf("alert.New: %v", err)
 	}
