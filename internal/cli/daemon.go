@@ -14,9 +14,9 @@ import (
 )
 
 // newDaemonCmd builds "airlock daemon", the long-running service and the
-// container's default command. It loads config, builds a Daemon (which
-// does its own wiring: runtime, observation backend, alerter), and runs it
-// until SIGINT or SIGTERM.
+// container's default command. It loads config and hands off to daemon.Run,
+// which wires up the runtime, observation backend, and alerter and drives
+// the daemon until SIGINT or SIGTERM.
 func newDaemonCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "daemon",
@@ -46,12 +46,7 @@ This is the container's default command.`,
 				logger.Warn("config warning", "message", w)
 			}
 
-			d, err := daemon.New(ctx, cfg, logger)
-			if err != nil {
-				return err
-			}
-
-			return d.Run(ctx)
+			return daemon.Run(ctx, cfg, logger)
 		},
 	}
 }

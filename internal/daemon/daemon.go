@@ -128,6 +128,11 @@ type Daemon struct {
 
 	selfID string
 
+	// clock is the daemon's time source, threaded in through Deps so a
+	// wiring test can drive time deterministically; nil is treated as
+	// time.Now (see now).
+	clock func() time.Time
+
 	heartbeatInterval time.Duration
 	debounce          time.Duration
 	resolvConfPath    string
@@ -135,25 +140,59 @@ type Daemon struct {
 	stateInterval     time.Duration
 }
 
-// New constructs a Daemon from cfg: it selects and constructs the
-// container runtime, builds the IG observation backend, and builds the
-// beacon-backed alerter. It does not touch the runtime's socket or start
-// observing; that is Run's job. ctx is used only to resolve airlock's own
-// self-id (an Inspect call against the runtime), never retained.
-func New(ctx context.Context, cfg *config.Config, logger *slog.Logger) (*Daemon, error) {
+// Deps carries run's collaborators. It is the testable seam (task #549): Run
+// builds Deps from the config file and the environment, then hands off to run;
+// a wiring test builds Deps directly with fakes (a core/runtime/runtimetest
+// Runtime doubling as the NetworkInspector, a fake observe.Backend, a
+// log-only alerter, a fake clock) and calls run to drive the real
+// reconcile/observe/watch loop with an injected failure, asserting it
+// surfaces rather than passing silently.
+//
+// The first block is the injectable boundary the production path constructs
+// from config and a test substitutes: the runtime and its NetworkInspector
+// view, the egress-observation backend airlock drives (the "driver"), the
+// beacon-backed alerter (the notifier), and the clock. The rest is the
+// resolved configuration and derived operational settings run threads into
+// the Daemon; a test sets them directly.
+type Deps struct {
+	Runtime runtime.Runtime
+	NetInsp runtime.NetworkInspector
+	Backend observe.Backend
+	Alerter *alert.Alerter
+	Clock   func() time.Time // daemon clock; nil defaults to time.Now
+
+	Config *config.Config
+	Logger *slog.Logger
+
+	SelfID            string
+	HeartbeatInterval time.Duration
+	Debounce          time.Duration
+	ResolvConfPath    string
+	StatePath         string
+	StateInterval     time.Duration
+}
+
+// Run is airlock's production daemon entry point: it selects and constructs
+// the container runtime, builds the IG observation backend and the
+// beacon-backed alerter, assembles Deps, and hands off to run, which drives
+// the reconcile/observe/watch loop until ctx is cancelled. Signal handling
+// belongs to the caller: Run and run only react to ctx. ctx is also used to
+// resolve airlock's own self-id (an Inspect call) at startup. Run is the
+// production entry point; run is the seam a wiring test drives with fakes.
+func Run(ctx context.Context, cfg *config.Config, logger *slog.Logger) error {
 	if logger == nil {
 		logger = slog.Default()
 	}
 
 	rt, err := buildRuntime(cfg)
 	if err != nil {
-		return nil, fmt.Errorf("daemon: %w", err)
+		return fmt.Errorf("daemon: %w", err)
 	}
 
 	netInsp, ok := rt.(runtime.NetworkInspector)
 	if !ok {
 		_ = rt.Close()
-		return nil, fmt.Errorf("daemon: runtime %T does not implement runtime.NetworkInspector (ListNetworks), which airlock's scope classification and net:<name> resolution both require", rt)
+		return fmt.Errorf("daemon: runtime %T does not implement runtime.NetworkInspector (ListNetworks), which airlock's scope classification and net:<name> resolution both require", rt)
 	}
 
 	backend := buildObserveBackend(cfg)
@@ -162,32 +201,76 @@ func New(ctx context.Context, cfg *config.Config, logger *slog.Logger) (*Daemon,
 	alerter, err := alert.New(cfg, resolver)
 	if err != nil {
 		_ = rt.Close()
-		return nil, fmt.Errorf("daemon: build alerter: %w", err)
+		return fmt.Errorf("daemon: build alerter: %w", err)
+	}
+
+	return run(ctx, Deps{
+		Runtime:           rt,
+		NetInsp:           netInsp,
+		Backend:           backend,
+		Alerter:           alerter,
+		Clock:             time.Now,
+		Config:            cfg,
+		Logger:            logger,
+		SelfID:            resolveSelfID(ctx, rt, logger),
+		HeartbeatInterval: heartbeatInterval(),
+		Debounce:          reconcileDebounce,
+		ResolvConfPath:    resolvConfPath(),
+		StatePath:         StatePath(),
+		StateInterval:     resolveStateInterval(),
+	})
+}
+
+// run assembles the Daemon from the injected Deps and drives its event loop
+// until ctx is cancelled. It is the seam a wiring test enters directly with a
+// fake runtime, fake backend, and a log-only alerter, injecting a fault (for
+// example Faults.List, which the initial reconcile trips) and asserting the
+// failure surfaces as run's error return rather than a silent success. The
+// loop owns d.Runtime's lifecycle and closes it before returning.
+func run(ctx context.Context, deps Deps) error {
+	logger := deps.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+	clock := deps.Clock
+	if clock == nil {
+		clock = time.Now
 	}
 
 	w := newWorld()
 
 	d := &Daemon{
-		cfg:               cfg,
+		cfg:               deps.Config,
 		logger:            logger,
-		rt:                rt,
-		netInsp:           netInsp,
-		backend:           backend,
-		alerter:           alerter,
+		rt:                deps.Runtime,
+		netInsp:           deps.NetInsp,
+		backend:           deps.Backend,
+		alerter:           deps.Alerter,
 		engine:            engine.New(w),
 		world:             w,
-		health:            newBackendHealthTracker(backend.Name()),
+		health:            newBackendHealthTracker(deps.Backend.Name()),
 		violations:        newViolationTally(),
 		unpolicied:        newUnpoliciedTracker(),
-		heartbeatInterval: heartbeatInterval(),
-		debounce:          reconcileDebounce,
-		resolvConfPath:    resolvConfPath(),
-		statePath:         StatePath(),
-		stateInterval:     resolveStateInterval(),
+		selfID:            deps.SelfID,
+		clock:             clock,
+		heartbeatInterval: deps.HeartbeatInterval,
+		debounce:          deps.Debounce,
+		resolvConfPath:    deps.ResolvConfPath,
+		statePath:         deps.StatePath,
+		stateInterval:     deps.StateInterval,
 	}
-	d.selfID = resolveSelfID(ctx, rt, logger)
 
-	return d, nil
+	return d.loop(ctx)
+}
+
+// now is the daemon's time source: d.clock if set, else time.Now. Every
+// wall-clock read in the loop goes through it so a wiring test can supply a
+// deterministic clock through Deps.
+func (d *Daemon) now() time.Time {
+	if d.clock != nil {
+		return d.clock()
+	}
+	return time.Now()
 }
 
 // buildRuntime selects and constructs the container runtime.
@@ -365,11 +448,12 @@ func containerIDFromFile(path string) string {
 	return containerIDPattern.FindString(string(data))
 }
 
-// Run drives the daemon until ctx is cancelled: an initial full reconcile,
+// loop drives the daemon until ctx is cancelled: an initial full reconcile,
 // then the event loop described in the package doc comment. It always
 // closes the runtime and stops every timer before returning, including on
-// error.
-func (d *Daemon) Run(ctx context.Context) error {
+// error. run is its only caller; the split lets a wiring test enter run with
+// injected Deps.
+func (d *Daemon) loop(ctx context.Context) error {
 	defer func() {
 		if err := d.rt.Close(); err != nil {
 			d.logger.Warn("daemon: close runtime", "error", err)
@@ -518,7 +602,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 // this is the single place a Violation ever reaches the alerter. Called
 // only from Run's own goroutine.
 func (d *Daemon) handleObserveEvent(ctx context.Context, ev observe.Event) {
-	d.health.RecordEvent(time.Now())
+	d.health.RecordEvent(d.now())
 
 	for _, v := range d.engine.Process(ev) {
 		d.recordAndAlertViolation(ctx, v)
