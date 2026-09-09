@@ -1,0 +1,50 @@
+# Self-hosted-runner smoke-proof (tagwright CI runner rollout, task #554 / #571).
+#
+# This runs IN PARALLEL with ci.yml's ubuntu-latest build; it does not replace
+# or touch it. It targets the self-hosted tagwright runner whose labels are
+# exactly tagwright,dind,self-hosted, and whose job environment already points
+# DOCKER_HOST at its own isolated privileged dind over TLS (the runner container
+# injects DOCKER_TLS_VERIFY/DOCKER_CERT_PATH, not this file). The load-bearing
+# thing being proven is that a real job is picked up by the runner AND can reach
+# that isolated dind; the Go build/vet/test then proves the toolchain and the
+# public module fetch work on the runner.
+#
+# Reversible: delete this file to remove the self-hosted leg entirely.
+
+name: CI (self-hosted)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-selfhosted:
+    # Must match the runner's LABELS set exactly (tagwright,dind,self-hosted);
+    # a label the runner does not carry leaves the job Queued forever.
+    runs-on: [self-hosted, tagwright, dind]
+    env:
+      GOPRIVATE: github.com/tagwright/*
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prove the isolated dind is reachable over TLS
+        run: |
+          docker version
+          docker info
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test ./...
