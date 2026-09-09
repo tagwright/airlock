@@ -5,6 +5,7 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"net/netip"
@@ -106,6 +107,35 @@ func TestDaemon_ReconcileDropsRemovedContainerAndForgetsEngineState(t *testing.T
 	}
 	if _, ok := d.world.ResolvedPolicy("c1"); ok {
 		t.Errorf("ResolvedPolicy(c1) after removal reconcile: ok = true, want false")
+	}
+}
+
+// TestDaemon_Reconcile_ListNetworksFailureSurfaces locks in that a
+// netInsp.ListNetworks failure fails CLOSED: reconcile returns the error
+// (wrapping the injected one) rather than proceeding as if the network
+// inventory were empty. ListNetworks backs @self/@project/net:<name>
+// group-token resolution and runs on every reconcile, so a swallowed
+// failure here would silently mis-resolve those scope tokens -- a
+// fail-open on egress correctness. The fake's listNetworksErr knob is the
+// fault this test trips; the initial reconcile (daemon.loop) propagates a
+// reconcile error out of run as a hard startup failure, so surfacing here
+// is what makes that path fail closed.
+func TestDaemon_Reconcile_ListNetworksFailureSurfaces(t *testing.T) {
+	cfg := newTestConfig(t)
+	c := armedContainer("c1", "web", map[string]string{"airlock.allow": "example.com"})
+	injected := errors.New("injected list-networks failure")
+	rt := &fakeRuntime{
+		containers:      []runtime.Container{c},
+		listNetworksErr: injected,
+	}
+	d := newTestDaemon(t, cfg, rt)
+
+	err := d.reconcile(context.Background())
+	if err == nil {
+		t.Fatalf("injected ListNetworks failure did not surface: reconcile returned nil (a silent success)")
+	}
+	if !errors.Is(err, injected) {
+		t.Fatalf("injected ListNetworks failure did not surface intact: reconcile error = %v, want it to wrap %v", err, injected)
 	}
 }
 
