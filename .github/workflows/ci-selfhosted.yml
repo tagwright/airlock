@@ -18,6 +18,10 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # Manual trigger, so the self-hosted smoke leg can be re-run from the
+  # Actions UI without a code push (there is no other way to re-run a
+  # self-hosted job that was cancelled or wedged). Matches the ballast pilot.
+  workflow_dispatch:
 
 jobs:
   build-selfhosted:
