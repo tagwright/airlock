@@ -178,7 +178,7 @@ type Defaults struct {
 // (internal/alert imports the beacon package, which self-registers every
 // backend it ships via init()), so hardcoding that list here would risk
 // drifting out of sync with it; an unknown Type surfaces as an error from
-// beacon.New instead, at alert-construction time.
+// courier.New instead, at alert-construction time.
 type Notifications struct {
 	Channels []NotificationChannel `yaml:"channels,omitempty"`
 }
@@ -187,23 +187,23 @@ type Notifications struct {
 type NotificationChannel struct {
 	// Type selects the backend, e.g. "ntfy", "discord", "smtp",
 	// "webhook". Required. Passed straight through to
-	// beacon.ChannelConfig.Type.
+	// courier.ChannelConfig.Type.
 	Type string `yaml:"type"`
 
 	// Name is an optional human label for this channel, distinct from
 	// Type, so a fleet with two channels of the same Type (say, two ntfy
 	// topics) can still be told apart in airlock's own error messages
-	// and logs. It plays no role in beacon itself (beacon.ChannelConfig
+	// and logs. It plays no role in beacon itself (courier.ChannelConfig
 	// has no name field); it defaults to Type when empty.
 	Name string `yaml:"name,omitempty"`
 
 	// MinLevel is the minimum severity this channel fires on. Empty
 	// means "receive everything". Passed through parseLevel to a
-	// beacon.Level.
+	// courier.Level.
 	MinLevel string `yaml:"min_level,omitempty"`
 
 	// Settings carries backend-specific config, passed straight through
-	// to beacon.ChannelConfig.Settings. Credential values are secret
+	// to courier.ChannelConfig.Settings. Credential values are secret
 	// NAMES resolved at send time by the backend itself (via the
 	// resolver internal/alert builds from SecretsDir), never literal
 	// tokens, per the suite-wide secrets rule -- this grammar has no

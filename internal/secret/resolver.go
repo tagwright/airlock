@@ -29,8 +29,8 @@ import (
 const DefaultSecretsDir = "/run/airlock/secrets"
 
 // Resolver resolves a named secret to its value. Its signature
-// intentionally matches beacon.SecretResolver so internal/alert can hand
-// it straight to beacon.New: channels and sinks name secrets, they never
+// intentionally matches courier.SecretResolver so internal/alert can hand
+// it straight to courier.New: channels and sinks name secrets, they never
 // contain them.
 type Resolver func(name string) (string, error)
 

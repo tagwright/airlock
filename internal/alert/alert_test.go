@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/tagwright/beacon"
+	"github.com/tagwright/courier"
 
 	"github.com/tagwright/airlock/internal/config"
 	"github.com/tagwright/airlock/internal/discovery"
@@ -23,22 +23,22 @@ import (
 // assertions, instead of contacting any real channel.
 type captureBackend struct {
 	mu   sync.Mutex
-	sent []beacon.Notification
+	sent []courier.Notification
 }
 
 func (c *captureBackend) Name() string { return "capture" }
 
-func (c *captureBackend) Send(_ context.Context, n beacon.Notification) error {
+func (c *captureBackend) Send(_ context.Context, n courier.Notification) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.sent = append(c.sent, n)
 	return nil
 }
 
-func (c *captureBackend) notifications() []beacon.Notification {
+func (c *captureBackend) notifications() []courier.Notification {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	out := make([]beacon.Notification, len(c.sent))
+	out := make([]courier.Notification, len(c.sent))
 	copy(out, c.sent)
 	return out
 }
@@ -46,14 +46,14 @@ func (c *captureBackend) notifications() []beacon.Notification {
 // The capture backend type is registered once for the whole test binary.
 // Individual tests are isolated from each other by a unique "id" setting
 // looked up in captureRegistry, not by registering a new backend type per
-// test (beacon.RegisterBackend panics on a duplicate type name).
+// test (courier.RegisterBackend panics on a duplicate type name).
 var (
 	captureRegistryMu sync.Mutex
 	captureRegistry   = map[string]*captureBackend{}
 )
 
 func init() {
-	beacon.RegisterBackend("capture", func(settings map[string]string, _ beacon.SecretResolver) (beacon.Backend, error) {
+	courier.RegisterBackend("capture", func(settings map[string]string, _ courier.SecretResolver) (courier.Backend, error) {
 		id := settings["id"]
 		captureRegistryMu.Lock()
 		defer captureRegistryMu.Unlock()
@@ -155,7 +155,7 @@ func TestFirstHitImmediate(t *testing.T) {
 		t.Fatalf("len(notifications) = %d, want 1 (first hit must alert immediately)", len(got))
 	}
 	n := got[0]
-	if n.Level != beacon.LevelWarning {
+	if n.Level != courier.LevelWarning {
 		t.Errorf("Level = %v, want LevelWarning for no-match", n.Level)
 	}
 	if !strings.Contains(n.Body, "renovate") || !strings.Contains(n.Body, "unlisted.example.com") {
@@ -259,11 +259,11 @@ func TestAuditModeNeverImmediateButDigest(t *testing.T) {
 func TestClassLevelMapping(t *testing.T) {
 	cases := []struct {
 		class engine.Class
-		want  beacon.Level
+		want  courier.Level
 	}{
-		{engine.ClassDeny, beacon.LevelError},
-		{engine.ClassUnresolvedIP, beacon.LevelError},
-		{engine.ClassNoMatch, beacon.LevelWarning},
+		{engine.ClassDeny, courier.LevelError},
+		{engine.ClassUnresolvedIP, courier.LevelError},
+		{engine.ClassNoMatch, courier.LevelWarning},
 	}
 	for _, c := range cases {
 		if got := classLevel(c.class); got != c.want {
@@ -300,7 +300,7 @@ func TestFloodBreakerCollapsesAtCap(t *testing.T) {
 		t.Fatalf("len(notifications) after crossing the flood cap = %d, want 4 (3 normal + 1 flood)", len(got))
 	}
 	flood := got[3]
-	if flood.Level != beacon.LevelError {
+	if flood.Level != courier.LevelError {
 		t.Errorf("flood notification Level = %v, want LevelError", flood.Level)
 	}
 	if !strings.Contains(flood.Title, "flooding") {

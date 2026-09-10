@@ -36,8 +36,8 @@
 // the daemon, not here -- and DO run concurrently with the event loop's
 // calls and with each other. All of an Alerter's mutable state is
 // therefore behind one mutex, held only for the duration of the state
-// touch itself; the (potentially slow, network-bound) beacon.Notify /
-// beacon.Report calls happen outside the lock.
+// touch itself; the (potentially slow, network-bound) courier.Notify /
+// courier.Report calls happen outside the lock.
 package alert
 
 import (
@@ -49,7 +49,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/tagwright/beacon"
+	"github.com/tagwright/courier"
 
 	"github.com/tagwright/airlock/internal/config"
 	"github.com/tagwright/airlock/internal/discovery"
@@ -141,12 +141,12 @@ type stickyDiag struct {
 }
 
 // Alerter routes engine.Violations and discovery.Diagnostics through a
-// beacon.Beacon per the Fork 6 alert-volume contract. Build one with New
+// courier.Beacon per the Fork 6 alert-volume contract. Build one with New
 // and reuse it for the process's lifetime.
 type Alerter struct {
 	mu sync.Mutex
 
-	b *beacon.Beacon
+	b *courier.Beacon
 
 	defaultWindow time.Duration
 	floodCap      int
@@ -196,7 +196,7 @@ func WithClock(now func() time.Time) Option {
 // is the one deviation surface airlock has nowhere else. Production never
 // passes it, so New builds the configured beacon exactly as before; a nil
 // argument is ignored, leaving the configured beacon in place.
-func WithBeacon(b *beacon.Beacon) Option {
+func WithBeacon(b *courier.Beacon) Option {
 	return func(a *Alerter) {
 		if b != nil {
 			a.b = b
@@ -224,8 +224,8 @@ func WithBeacon(b *beacon.Beacon) Option {
 // a resolved policy.Policy is a per-container, per-reconcile fact, not
 // something available once at construction time.
 func New(cfg *config.Config, resolver secret.Resolver, opts ...Option) (*Alerter, error) {
-	channels := make([]beacon.ChannelConfig, 0, len(cfg.Notifications.Channels)+1)
-	channels = append(channels, beacon.ChannelConfig{Type: "log", MinLevel: beacon.LevelInfo})
+	channels := make([]courier.ChannelConfig, 0, len(cfg.Notifications.Channels)+1)
+	channels = append(channels, courier.ChannelConfig{Type: "log", MinLevel: courier.LevelInfo})
 	for i, c := range cfg.Notifications.Channels {
 		level, err := parseLevel(c.MinLevel)
 		if err != nil {
@@ -235,24 +235,24 @@ func New(cfg *config.Config, resolver secret.Resolver, opts ...Option) (*Alerter
 			}
 			return nil, fmt.Errorf("alert: notifications.channels[%d] (%s): %w", i, label, err)
 		}
-		channels = append(channels, beacon.ChannelConfig{
+		channels = append(channels, courier.ChannelConfig{
 			Type:     c.Type,
 			MinLevel: level,
 			Settings: c.Settings,
 		})
 	}
 
-	telemetry := make([]beacon.TelemetryConfig, 0, len(cfg.Telemetry))
+	telemetry := make([]courier.TelemetryConfig, 0, len(cfg.Telemetry))
 	for _, t := range cfg.Telemetry {
-		telemetry = append(telemetry, beacon.TelemetryConfig{Type: t.Type, Settings: t.Settings})
+		telemetry = append(telemetry, courier.TelemetryConfig{Type: t.Type, Settings: t.Settings})
 	}
 
-	var resolve beacon.SecretResolver
+	var resolve courier.SecretResolver
 	if resolver != nil {
-		resolve = beacon.SecretResolver(resolver)
+		resolve = courier.SecretResolver(resolver)
 	}
 
-	b, err := beacon.New(beacon.Config{Channels: channels, Telemetry: telemetry}, resolve)
+	b, err := courier.New(courier.Config{Channels: channels, Telemetry: telemetry}, resolve)
 	if err != nil {
 		return nil, fmt.Errorf("alert: building beacon: %w", err)
 	}
@@ -284,17 +284,17 @@ func New(cfg *config.Config, resolver secret.Resolver, opts ...Option) (*Alerter
 }
 
 // parseLevel maps a config.NotificationChannel.MinLevel string onto a
-// beacon.Level. An empty value means "receive everything" (LevelInfo).
+// courier.Level. An empty value means "receive everything" (LevelInfo).
 // Mirrors ballast's and bilgeline's daemon.parseLevel exactly, the suite's
 // established shape for this concern.
-func parseLevel(s string) (beacon.Level, error) {
+func parseLevel(s string) (courier.Level, error) {
 	switch strings.ToLower(strings.TrimSpace(s)) {
 	case "", "info":
-		return beacon.LevelInfo, nil
+		return courier.LevelInfo, nil
 	case "warn", "warning":
-		return beacon.LevelWarning, nil
+		return courier.LevelWarning, nil
 	case "error":
-		return beacon.LevelError, nil
+		return courier.LevelError, nil
 	default:
 		return 0, fmt.Errorf("unknown notification level %q", s)
 	}
@@ -328,7 +328,7 @@ func (a *Alerter) windowFor(service string) time.Duration {
 	return a.defaultWindow
 }
 
-// classLevel maps a violation Class to a beacon.Level.
+// classLevel maps a violation Class to a courier.Level.
 //
 // ClassDeny and ClassUnresolvedIP both map to LevelError: a deny is an
 // explicit, deliberate policy statement being violated right now, and an
@@ -340,12 +340,12 @@ func (a *Alerter) windowFor(service string) time.Duration {
 // legitimate destination nobody got around to allowlisting yet -- worth
 // surfacing, but it does not carry the same "something is deliberately
 // wrong or actively hiding" charge the other two classes do.
-func classLevel(c engine.Class) beacon.Level {
+func classLevel(c engine.Class) courier.Level {
 	switch c {
 	case engine.ClassDeny, engine.ClassUnresolvedIP:
-		return beacon.LevelError
+		return courier.LevelError
 	default:
-		return beacon.LevelWarning
+		return courier.LevelWarning
 	}
 }
 
@@ -465,13 +465,13 @@ func (a *Alerter) countFlood(containerID string, now time.Time) (flooding, notif
 
 func (a *Alerter) sendFlood(ctx context.Context, v engine.Violation) error {
 	label := containerLabel(v)
-	return a.b.Notify(ctx, beacon.Notification{
+	return a.b.Notify(ctx, courier.Notification{
 		Title: fmt.Sprintf("airlock: %s flooding", label),
 		Body: fmt.Sprintf(
 			"%s has exceeded %d distinct violation identities in the last hour and is being collapsed to this single alert; individual violations are absorbed into the next digest until the rate falls.",
 			label, a.floodCap,
 		),
-		Level: beacon.LevelError,
+		Level: courier.LevelError,
 		Tags:  []string{"airlock", "flood"},
 		Fields: map[string]string{
 			"service":        v.Service,
@@ -485,7 +485,7 @@ func (a *Alerter) sendFlood(ctx context.Context, v engine.Violation) error {
 // containerName. Called from the daemon's serialized event loop, once per
 // diagnostic produced by a discovery/resolve pass for that container.
 //
-// An Error-level diagnostic alerts immediately (beacon.LevelError) the
+// An Error-level diagnostic alerts immediately (courier.LevelError) the
 // FIRST time this exact (container, message) pair is seen; a re-feed of
 // the identical diagnostic on a later reconcile pass does not re-alert, it
 // only refreshes the sticky bookkeeping so the digest keeps listing it. A
@@ -611,14 +611,14 @@ func (a *Alerter) SuppressedByService() map[string]int {
 // Report pushes a health heartbeat through beacon's configured telemetry
 // sinks (e.g. a Gatus external endpoint), for the dead-man's-switch leg.
 // The daemon calls this periodically; no timer lives in this package. A
-// nil telemetry configuration makes this a no-op success (beacon.Report
+// nil telemetry configuration makes this a no-op success (courier.Report
 // fans out to zero sinks and returns nil).
 func (a *Alerter) Report(ctx context.Context, healthy bool) error {
 	msg := "ok"
 	if !healthy {
 		msg = "unhealthy"
 	}
-	return a.b.Report(ctx, beacon.Health{Name: "airlock", OK: healthy, Message: msg})
+	return a.b.Report(ctx, courier.Health{Name: "airlock", OK: healthy, Message: msg})
 }
 
 // Digest assembles and sends ONE beacon notification summarizing
@@ -817,7 +817,7 @@ func destinationLabel(v engine.Violation) string {
 	return v.DstIP.String()
 }
 
-// violationNotification builds the beacon.Notification for one immediate
+// violationNotification builds the courier.Notification for one immediate
 // alert, per the frozen doc's "a clear human-readable message: service,
 // destination ... port, class, container name/id, and both DNS and SNI
 // evidence when present" requirement. sinceLastAlert is 0 for a first-hit
@@ -828,7 +828,7 @@ func destinationLabel(v engine.Violation) string {
 // disagreement between the two never means "SNI overrode DNS" -- it means
 // DNS alone decided this verdict, and SNI is shown alongside only because
 // it is additional context a human investigating the alert may want.
-func violationNotification(v engine.Violation, sinceLastAlert int) beacon.Notification {
+func violationNotification(v engine.Violation, sinceLastAlert int) courier.Notification {
 	dest := destinationLabel(v)
 
 	var body strings.Builder
@@ -877,7 +877,7 @@ func violationNotification(v engine.Violation, sinceLastAlert int) beacon.Notifi
 		fields["since_last_alert"] = strconv.Itoa(sinceLastAlert)
 	}
 
-	return beacon.Notification{
+	return courier.Notification{
 		Title:  fmt.Sprintf("airlock: %s violation (%s)", v.Class, v.Service),
 		Body:   body.String(),
 		Level:  classLevel(v.Class),
@@ -886,15 +886,15 @@ func violationNotification(v engine.Violation, sinceLastAlert int) beacon.Notifi
 	}
 }
 
-func diagnosticNotification(containerID, containerName string, d discovery.Diagnostic) beacon.Notification {
+func diagnosticNotification(containerID, containerName string, d discovery.Diagnostic) courier.Notification {
 	label := containerName
 	if label == "" {
 		label = shortID(containerID)
 	}
-	return beacon.Notification{
+	return courier.Notification{
 		Title: fmt.Sprintf("airlock: validation error (%s)", label),
 		Body:  d.Message,
-		Level: beacon.LevelError,
+		Level: courier.LevelError,
 		Tags:  []string{"airlock", "validation"},
 		Fields: map[string]string{
 			"container_id":   containerID,
@@ -904,12 +904,12 @@ func diagnosticNotification(containerID, containerName string, d discovery.Diagn
 }
 
 // digestNotification assembles the single periodic digest notification.
-func digestNotification(suppressed, audit []identityCount, floods []floodEpisode, stickies []stickyRow, unpolicied []string) beacon.Notification {
+func digestNotification(suppressed, audit []identityCount, floods []floodEpisode, stickies []stickyRow, unpolicied []string) courier.Notification {
 	if len(suppressed) == 0 && len(audit) == 0 && len(floods) == 0 && len(stickies) == 0 && len(unpolicied) == 0 {
-		return beacon.Notification{
+		return courier.Notification{
 			Title: "airlock: digest",
 			Body:  "Nothing to report this period.",
-			Level: beacon.LevelInfo,
+			Level: courier.LevelInfo,
 			Tags:  []string{"airlock", "digest"},
 		}
 	}
@@ -950,10 +950,10 @@ func digestNotification(suppressed, audit []identityCount, floods []floodEpisode
 		}
 	}
 
-	return beacon.Notification{
+	return courier.Notification{
 		Title: "airlock: digest",
 		Body:  b.String(),
-		Level: beacon.LevelInfo,
+		Level: courier.LevelInfo,
 		Tags:  []string{"airlock", "digest"},
 		Fields: map[string]string{
 			"suppressed_identities": strconv.Itoa(len(suppressed)),

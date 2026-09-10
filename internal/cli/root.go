@@ -68,7 +68,7 @@ func newRootCmd() *cobra.Command {
 		Long: `airlock gives per-container network egress visibility for Docker and Podman,
 evaluates a declared egress policy expressed in container labels (or named
 groups for a whole class of containers at once), and alerts on deviations
-through beacon. It observes through Inspektor Gadget's eBPF tracing and
+through courier. It observes through Inspektor Gadget's eBPF tracing and
 never blocks traffic in v1.
 
 The daemon is the normal way to run it; validate, status, and suggest are

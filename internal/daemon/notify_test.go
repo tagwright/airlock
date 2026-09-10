@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/tagwright/beacon"
-	"github.com/tagwright/beacon/beacontest"
+	"github.com/tagwright/courier"
+	"github.com/tagwright/courier/beacontest"
 
 	"github.com/tagwright/airlock/internal/alert"
 	"github.com/tagwright/airlock/internal/observe"
@@ -18,7 +18,7 @@ import (
 
 // TestDeviationAlert_FiresOperatorAlert is the additive notifier assertion for
 // airlock's one alert-contracted surface: a live egress deviation reaches the
-// operator ONLY through beacon. airlock v1 is detect-and-alert, so a deviation
+// operator ONLY through courier. airlock v1 is detect-and-alert, so a deviation
 // has no error return and no run record; the beacon alert is the whole output.
 // This drives a real violation through the daemon's observe-event wiring
 // (handleObserveEvent -> recordAndAlertViolation -> alerter.Violation ->
@@ -31,7 +31,7 @@ import (
 // Testing Standard closes; the runtimetest Level 2 test cannot reach this
 // notifier-only surface.
 func TestDeviationAlert_FiresOperatorAlert(t *testing.T) {
-	capBeacon, capture := beacontest.New(beacon.LevelInfo)
+	capBeacon, capture := beacontest.New(courier.LevelInfo)
 
 	cfg := newTestConfig(t)
 	c := armedContainer("c1", "web", map[string]string{"airlock.allow": "example.com"})
@@ -59,11 +59,11 @@ func TestDeviationAlert_FiresOperatorAlert(t *testing.T) {
 	if capture.Count() == 0 {
 		t.Fatal("egress deviation fired no operator alert: airlock went silent on a violation, and beacon is its only surface for a deviation")
 	}
-	if !capture.FiredAtLevel(beacon.LevelError) {
+	if !capture.FiredAtLevel(courier.LevelError) {
 		lvl, _ := capture.HighestLevel()
 		t.Fatalf("deviation alert did not fire at Error level (unresolved-ip maps to LevelError); highest captured level was %v; captured: %+v", lvl, capture.Notifications())
 	}
-	if !capture.Contains(beacon.LevelError, "violation") {
+	if !capture.Contains(courier.LevelError, "violation") {
 		t.Fatalf("the Error-level alert did not read as a violation alert; captured: %+v", capture.Notifications())
 	}
 }
