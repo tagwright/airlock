@@ -18,8 +18,8 @@ config-as-code companion tools for Docker and Podman.
 ## Scope in v1: detect and alert only
 
 airlock does not block traffic and is not a firewall. It observes egress
-and raises alerts when a connection does not match the declared policy;
-nothing it does ever drops or rejects a packet.
+and raises alerts when a connection does not match the declared policy.
+Nothing it does ever drops or rejects a packet.
 
 Inline blocking is deferred to a later release, and it will arrive with
 tagwright's own eBPF backend (`bathyscaphe`), not with Inspektor Gadget.
@@ -45,7 +45,7 @@ Read this before writing your first label. It shapes what "allow" and
 - TLS SNI is observed too, but it is **enrichment only**. It is shown
   alongside DNS evidence in an alert so a human has more context, but it
   never decides whether a connection matches a rule, in either direction.
-  (An earlier build let SNI settle disagreements with DNS; a real
+  (An earlier build let SNI settle disagreements with DNS. A real
   integration pass showed that misattributes one connection's SNI to a
   different, unrelated connection from the same container, which can turn
   a real violation into a false negative. airlock is fail-closed on SNI
@@ -54,7 +54,7 @@ Read this before writing your first label. It shapes what "allow" and
   name-based rule. It either matches an IP/CIDR rule directly or it falls
   through as its own violation class, `unresolved-ip`, distinct from an
   ordinary undeclared destination (`no-match`). There is no "ignore
-  unresolved" knob; the escape is to allowlist the IP or CIDR explicitly.
+  unresolved" knob. The escape is to allowlist the IP or CIDR explicitly.
 - Evaluation happens once, at connect time. A policy change never
   re-judges a connection that already happened.
 
@@ -145,7 +145,7 @@ independently:
 - **Container labels** (`airlock.*`, or the `tagwright.egress.*` alias)
   declare one container's own policy: `airlock.enable`, `airlock.allow`/
   `airlock.deny`, right on the container they govern. Both prefixes carry
-  the identical suffix grammar; the same key under both with different
+  the identical suffix grammar. The same key under both with different
   values is a validation error, and the container's policy is skipped
   until it's fixed.
 - **`airlock.yml`** is where fleet-wide concerns live that do not belong
@@ -189,10 +189,26 @@ To confirm the whole loop end to end: label a container `airlock.enable:
 connection, then run `airlock suggest <container>` and check that it
 lists what you expect. Prune the result into `airlock.allow`, drop the
 `mode` label, and make that container connect somewhere not on its new
-allowlist (or wait for it to happen naturally) — you should see an alert
+allowlist (or wait for it to happen naturally). You should see an alert
 land on whichever beacon channel you configured, within one dedup window
 (`airlock.alert.window`, default `1h`). The very first occurrence of a new
 violation identity fires immediately regardless of the window.
+
+## Documentation
+
+- [docs/DEPLOY.md](docs/DEPLOY.md): the privileged deploy this needs, the
+  privilege trade-off behind it, the two-file policy model, secrets, and how to
+  confirm it worked. Read it before deploying anywhere you care about.
+- [docs/LABELS.md](docs/LABELS.md): the complete v1 label grammar and
+  `airlock.yml` schema, down to the reserved-and-rejected surface, tracked
+  against the running code.
+- [docs/OPERATIONS.md](docs/OPERATIONS.md): running airlock day to day. The
+  audit onramp, the three read-only CLI commands, alert tuning, the
+  observation-scope model, and a troubleshooting section for when no events
+  flow.
+- [docs/TESTING.md](docs/TESTING.md): the test methodology and an honest
+  accounting of what is proven against a real Docker socket and a real `ig`,
+  as opposed to what only passes against fakes.
 
 ## License
 
