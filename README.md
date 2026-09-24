@@ -209,6 +209,8 @@ violation identity fires immediately regardless of the window.
 - [docs/TESTING.md](docs/TESTING.md): the test methodology and an honest
   accounting of what is proven against a real Docker socket and a real `ig`,
   as opposed to what only passes against fakes.
+- [docs/SECURITY.md](docs/SECURITY.md): what an alert does and does not
+  promise, the privilege airlock runs with, and how to report a vulnerability.
 
 ## License
 
