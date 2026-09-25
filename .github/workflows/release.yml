@@ -48,7 +48,32 @@ on:
       - 'v*'
 
 jobs:
+  # The load-bearing gate (tagwright Testing Standard, task #548): the release
+  # runs the live harness itself, at the exact tag it is publishing, on the
+  # self-hosted runner, and refuses to publish if it fails. It also asserts the
+  # LAST-RUN operator attestation matches this tag. publish `needs` it, so a red
+  # harness blocks the image from ever reaching GHCR.
+  harness:
+    runs-on: [self-hosted, tagwright, dind]
+    env:
+      GOPRIVATE: github.com/tagwright/*
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prove the isolated dind is reachable over TLS
+        run: |
+          docker version
+          docker info
+
+      - name: Run the live integration harness at the tag
+        run: test/integration/run-all.sh
+
+      - name: Verify LAST-RUN attests the operator-run bucket at this tag
+        run: test/enforce/check-last-run.sh --release "${GITHUB_SHA}"
+
   publish:
+    needs: harness
     runs-on: ubuntu-latest
     permissions:
       contents: read

@@ -1,0 +1,29 @@
+# Live integration harness attestation (tagwright Testing Standard, task #548).
+#
+# This file records the last full operator-run of the harness. The CI-gated
+# scenarios (everything in run-all.sh) are re-run by the release job at the tag
+# it publishes and gate the publish directly, so their attestation here is
+# informational. The load-bearing rows are the operator-run bucket: paths that
+# can only be exercised against a real external service and so cannot run in the
+# isolated CI dind. The release job asserts `sha` below equals the tagged commit
+# exactly (test/enforce/check-last-run.sh), so an operator-run row is only valid
+# for the sha it was produced at.
+#
+# Regenerate with: test/integration/gen-last-run.sh   (after running the harness)
+
+sha: 0000000000000000000000000000000000000000
+date: unattested
+harness: run-all.sh
+
+# CI-gated scenarios: run by ci-selfhosted.yml on every push and by the release
+# job at the tag. Status here is informational only.
+ci_gated: 4 scenarios, gated in CI (see run-all.sh)
+
+# Operator-run bucket (permanent-exempt: real external services only). Each row
+# is <scenario>: <result> and must be regenerated at the release sha. Empty for
+# airlock: every scenario stands up its own throwaway backend inside the dind (a
+# real privileged ig, a throwaway ntfy server, throwaway target/netshoot
+# containers, real Docker networks) over the isolated socket, so all four are
+# CI-gated. If a scenario needing a real external service is ever added, it lands
+# here.
+operator_run: none

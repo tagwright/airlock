@@ -1,30 +1,32 @@
-# Self-hosted-runner smoke-proof (tagwright CI runner rollout, task #554 / #571).
+# The live integration harness as a CI gate (tagwright Testing Standard, task
+# #548). This runs on the self-hosted tagwright runner (labels tagwright,dind,
+# self-hosted) whose jobs talk to an ISOLATED privileged dind over TLS
+# (DOCKER_HOST/DOCKER_TLS_VERIFY/DOCKER_CERT_PATH are injected by the runner
+# container, not set here), NEVER the production socket. The harness builds the
+# shipped image inside that scratch dind and drives it against throwaway
+# backends; every scenario runs a real privileged ig (--privileged --pid=host)
+# and throwaway containers over the dind's own socket, which is why the
+# socket-and-kernel-privileged tool works under a TCP-only runner whose dind is
+# itself privileged.
 #
-# This runs IN PARALLEL with ci.yml's ubuntu-latest build; it does not replace
-# or touch it. It targets the self-hosted tagwright runner whose labels are
-# exactly tagwright,dind,self-hosted, and whose job environment already points
-# DOCKER_HOST at its own isolated privileged dind over TLS (the runner container
-# injects DOCKER_TLS_VERIFY/DOCKER_CERT_PATH, not this file). The load-bearing
-# thing being proven is that a real job is picked up by the runner AND can reach
-# that isolated dind; the Go build/vet/test then proves the toolchain and the
-# public module fetch work on the runner.
+# Trigger discipline (CI Runner page): push and manual only, on org-owned
+# branches, NEVER a fork pull_request, because a privileged self-hosted runner
+# on a public repo must never execute outside code. Fork-PR coverage stays on
+# the hosted leg (ci.yml, ubuntu-latest).
 #
 # Reversible: delete this file to remove the self-hosted leg entirely.
 
-name: CI (self-hosted)
+name: CI (self-hosted harness)
 
 on:
   push:
     branches: [main]
-  pull_request:
-    branches: [main]
-  # Manual trigger, so the self-hosted smoke leg can be re-run from the
-  # Actions UI without a code push (there is no other way to re-run a
-  # self-hosted job that was cancelled or wedged). Matches the ballast pilot.
+  # Manual trigger, so the harness can be re-run from the Actions UI without a
+  # code push (there is no other way to re-run a wedged self-hosted job).
   workflow_dispatch:
 
 jobs:
-  build-selfhosted:
+  harness:
     # Must match the runner's LABELS set exactly (tagwright,dind,self-hosted);
     # a label the runner does not carry leaves the job Queued forever.
     runs-on: [self-hosted, tagwright, dind]
@@ -35,20 +37,14 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Prove the isolated dind is reachable over TLS
+        # A green here is the proof the job reached its scratch dind over
+        # DOCKER_HOST/TLS (there is no host socket to fall back to).
         run: |
           docker version
           docker info
 
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: '1.25'
-
-      - name: Build
-        run: go build ./...
-
-      - name: Vet
-        run: go vet ./...
-
-      - name: Test
-        run: go test ./...
+      - name: Run the live integration harness
+        # run-all.sh builds airlock-itest:latest in the scratch dind and drives
+        # every scenario end to end (probe, detect, groups, pass3), exercising
+        # the real detect-and-alert pipeline against a real privileged ig.
+        run: test/integration/run-all.sh
