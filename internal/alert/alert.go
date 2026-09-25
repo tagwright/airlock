@@ -180,30 +180,6 @@ type Alerter struct {
 	unpolicied []string
 }
 
-// Option configures an Alerter at construction time.
-type Option func(*Alerter)
-
-// WithClock overrides an Alerter's time source. Meant for tests: the
-// window and flood-breaker logic is otherwise driven by time.Now, which
-// makes an hour-scale flood window impractical to exercise directly.
-func WithClock(now func() time.Time) Option {
-	return func(a *Alerter) { a.now = now }
-}
-
-// WithBeacon overrides the beacon an Alerter delivers alerts through. It is a
-// test seam: a wiring test injects a capturing beacon (via beacon/beacontest)
-// to assert that a violation actually reaches the operator alert channel, which
-// is the one deviation surface airlock has nowhere else. Production never
-// passes it, so New builds the configured beacon exactly as before; a nil
-// argument is ignored, leaving the configured beacon in place.
-func WithBeacon(b *courier.Beacon) Option {
-	return func(a *Alerter) {
-		if b != nil {
-			a.b = b
-		}
-	}
-}
-
 // New builds an Alerter from cfg's notification and telemetry
 // configuration, resolving named channel/sink secrets through resolver
 // (typically secret.FileEnvResolver(cfg.SecretsDir); nil is accepted and
@@ -223,7 +199,7 @@ func WithBeacon(b *courier.Beacon) Option {
 // container window overrides come later, via SetWindow, not through New:
 // a resolved policy.Policy is a per-container, per-reconcile fact, not
 // something available once at construction time.
-func New(cfg *config.Config, resolver secret.Resolver, opts ...Option) (*Alerter, error) {
+func New(cfg *config.Config, resolver secret.Resolver) (*Alerter, error) {
 	channels := make([]courier.ChannelConfig, 0, len(cfg.Notifications.Channels)+1)
 	channels = append(channels, courier.ChannelConfig{Type: "log", MinLevel: courier.LevelInfo})
 	for i, c := range cfg.Notifications.Channels {
@@ -276,9 +252,6 @@ func New(cfg *config.Config, resolver secret.Resolver, opts ...Option) (*Alerter
 		containers:    make(map[string]*containerFloodState),
 		sticky:        make(map[string]*stickyDiag),
 		auditTally:    make(map[engine.Identity]int),
-	}
-	for _, opt := range opts {
-		opt(a)
 	}
 	return a, nil
 }

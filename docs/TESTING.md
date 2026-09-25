@@ -197,7 +197,7 @@ the point where `internal/daemon.Run` wires `internal/engine` to
 `internal/alert`:
 
 **Deferred (flushed) violations were alerted but never tallied.**
-`internal/engine`'s deferral mechanism (`pending.go`) exists specifically
+`internal/engine`'s deferral mechanism (pending.go) exists specifically
 because a TLS ClientHello's SNI name arrives *after* the TCP connect it
 belongs to -- so a would-be default-deny-floor violation against a
 policy with any domain-based allow entry is held for up to `sniWindow`
@@ -223,7 +223,7 @@ extracting the tally-then-alert sequence into
 drift apart again silently.
 
 UPDATE (fail-closed-on-SNI pass): the deferral mechanism this bug lived in
-(`pending.go`, `engine.Flush`, `Run`'s `flush` case) has since been
+(pending.go, `engine.Flush`, `Run`'s `flush` case) has since been
 removed entirely -- see "RESOLVED" below -- so there is no longer a second
 call site for `recordAndAlertViolation` to guard against drifting from.
 The helper itself is kept (now with a single caller,
@@ -235,8 +235,9 @@ apart if a second call site is ever added again.
 Standing up a real ntfy channel for the detect-and-alert proof below
 surfaced that `airlock.example.yml`'s `notifications.channels` examples
 used the wrong settings keys: `ntfy`'s block said `token`, `discord`'s
-said `webhook_url`. beacon's real backends
-(`github.com/tagwright/beacon`'s `ntfy.go`/`discord.go`) read
+said `webhook_url`. courier's real backends
+(`github.com/tagwright/courier/ntfy.go` and
+`github.com/tagwright/courier/discord.go`) read
 `token_secret` and `webhook_secret` respectively. Neither is validated at
 airlock's config-load layer (`internal/config` only checks `Type` is
 non-empty; the settings map passes through to beacon verbatim), so a
@@ -293,7 +294,7 @@ SNI never rescued it, a deliberate, documented limitation of the
 deferred-verdict design of that time.
 
 **This entire code path no longer exists.** The deferral mechanism
-(`pending.go`, `Engine.Flush`) that made a "rescued" verdict possible was
+(pending.go, `Engine.Flush`) that made a "rescued" verdict possible was
 removed as part of the fail-closed-on-SNI fix below: every verdict is now
 decided synchronously and finally at connect time, so there is no
 "deferred-then-rescued" state left to go stale in `suggestions`. Kept here
@@ -344,7 +345,7 @@ One consequence: since DNS-based name matching is already available at
 connect time (DNS precedes the connect), there was no longer anything for
 a "wait briefly for a late SNI" deferral to accomplish. The deferred-
 verdict machinery this section's mechanism analysis above referenced
-(`pending.go`, `Engine.Flush`, the daemon's flush ticker) was removed
+(pending.go, `Engine.Flush`, the daemon's flush ticker) was removed
 entirely: `engine.Process` now returns a Connection's final verdict
 synchronously, always. `run-detect.sh` no longer needs to space its three
 connections 8 seconds apart to dodge this risk -- fail-closed matching
@@ -489,7 +490,7 @@ second run with identical results.
 | Real alert delivery, discord/smtp/webhook | **Not yet tested** | Same boundary ballast documents for its own notification backends: these live in `github.com/tagwright/beacon` and need a live external endpoint/account this repo-local harness doesn't have. |
 | Gatus telemetry sink | **Not yet tested** | No itest configures `telemetry`; needs a real Gatus push-URL target. |
 | SNI correlation across close-together connections | **RESOLVED (fail-closed on SNI)** | See the dedicated section above. Nate ratified fail-closed on SNI as the fix; the deferral machinery this risk depended on is removed entirely. `run-detect.sh` now fires its three connections back to back rather than spaced, as part of the proof. |
-| Podman backend, IG-side | **Not yet tested** | This pass only exercised the Docker runtime end to end. `internal/daemon`'s `resolvedRuntimeName`/`observeRuntimes` fix is unit-tested (`TestObserveRuntimes_TracksAirlockRuntime`) for the `AIRLOCK_RUNTIME=podman` case, but no itest here stands up a real Podman socket the way `ballast`'s `run-podman.sh` does. |
+| Podman backend, IG-side | **Not yet tested** | This pass only exercised the Docker runtime end to end. `internal/daemon`'s `resolvedRuntimeName`/`observeRuntimes` fix is unit-tested (`TestObserveRuntimes_TracksAirlockRuntime`) for the `AIRLOCK_RUNTIME=podman` case, but no itest here stands up a real Podman socket the way `ballast`'s run-podman.sh does. |
 | Digest pinning (`Options.Images`) | **Not exercised** | Every capture/detect run in this and pass 2 used `:latest` gadget images (this suite's own default). Digest pinning is a packaging-time decision documented as a TODO in `internal/observe/ig`'s package doc; not itself a behavior this harness can meaningfully test differently. |
 | Group matching by network (Fork 8), no per-container label | **Integration-proven (pass 2)** | `run-groups.sh`: `airlock-itest-a`/`-b`, zero `airlock.*` labels, armed entirely by a `match: {network: ...}` group. `state.json`'s `matched_groups` confirms the match. |
 | `@self` under `scope: all`, against real core network data | **Integration-proven (pass 2)** | `run-groups.sh`: `a -> b` on the same group network allowed via `@self`; `a -> 1.1.1.1` (external) violated. First live exercise of core's `ListNetworks`/`Container.Networks` extension (`f6cd8da`) -- previously fake-`World`-only. |

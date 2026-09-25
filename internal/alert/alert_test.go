@@ -65,9 +65,9 @@ func init() {
 	})
 }
 
-// testClock is a settable clock handed to New via WithClock, so window and
-// flood-breaker logic (built around hour-and-minute scale durations) is
-// testable without a real sleep.
+// testClock is a settable clock assigned to an Alerter's now field by
+// newTestAlerter, so window and flood-breaker logic (built around
+// hour-and-minute scale durations) is testable without a real sleep.
 type testClock struct {
 	mu sync.Mutex
 	t  time.Time
@@ -114,10 +114,14 @@ func newTestAlerter(t *testing.T, window time.Duration, floodCap int, t0 time.Ti
 	}
 
 	clock := &testClock{t: t0}
-	a, err := New(cfg, nil, WithClock(clock.Now))
+	a, err := New(cfg, nil)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
+	// Same-package test injects the clock directly; New sets a.now to time.Now
+	// and does nothing time-sensitive during construction, so overriding it here
+	// (before any Violation call) is equivalent to constructing with it.
+	a.now = clock.Now
 	return a, cb, clock
 }
 

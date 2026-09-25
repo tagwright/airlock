@@ -461,7 +461,7 @@ func TestDefaultsAlertWindowDurationParses(t *testing.T) {
 func TestExampleFileLoads(t *testing.T) {
 	data, err := os.ReadFile("../../airlock.example.yml")
 	if err != nil {
-		t.Skipf("airlock.example.yml not found relative to test: %v", err)
+		t.Fatalf("airlock.example.yml is a committed repo file and must load: %v", err)
 	}
 	path := writeConfig(t, string(data))
 	c, err := Load(path)

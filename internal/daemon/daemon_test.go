@@ -25,9 +25,9 @@ import (
 // coordinates) and a real alert.Alerter wired only to beacon's built-in
 // "log" backend, so Violation/Diagnostic/Digest/Report are safe to call
 // with no network I/O.
-func newTestDaemon(t *testing.T, cfg *config.Config, rt *fakeRuntime, alertOpts ...alert.Option) *Daemon {
+func newTestDaemon(t *testing.T, cfg *config.Config, rt *fakeRuntime) *Daemon {
 	t.Helper()
-	alerter, err := alert.New(cfg, nil, alertOpts...)
+	alerter, err := alert.New(cfg, nil)
 	if err != nil {
 		t.Fatalf("alert.New: %v", err)
 	}
@@ -166,9 +166,9 @@ func TestDaemon_HandleObserveEvent_RecordsUnarmedConnectionAsObserved(t *testing
 		DstIP: mustAddr(t, "198.51.100.7"), DstPort: 443, Proto: "tcp", Timestamp: time.Now(),
 	})
 
-	got := d.engine.Observed("c1")
+	got := d.engine.ObservedSnapshot()["c1"]
 	if len(got) != 1 {
-		t.Fatalf("engine.Observed(c1) = %+v, want exactly one recorded destination", got)
+		t.Fatalf("engine.ObservedSnapshot()[c1] = %+v, want exactly one recorded destination", got)
 	}
 	if got[0].DstIP.String() != "198.51.100.7" || got[0].Port != 443 {
 		t.Errorf("recorded observation = %+v, want 198.51.100.7:443", got[0])
@@ -194,9 +194,9 @@ func TestDaemon_HandleObserveEvent_ArmedConnectionRecordsRealVerdict(t *testing.
 		DstIP: mustAddr(t, "198.51.100.7"), DstPort: 443, Proto: "tcp", Timestamp: time.Now(),
 	})
 
-	got := d.engine.Observed("c1")
+	got := d.engine.ObservedSnapshot()["c1"]
 	if len(got) != 1 {
-		t.Fatalf("engine.Observed(c1) = %+v, want exactly one recorded destination", got)
+		t.Fatalf("engine.ObservedSnapshot()[c1] = %+v, want exactly one recorded destination", got)
 	}
 	if got[0].Verdict != "allowed" {
 		t.Errorf("recorded verdict for an armed, allow: \"*\" container = %q, want %q", got[0].Verdict, "allowed")

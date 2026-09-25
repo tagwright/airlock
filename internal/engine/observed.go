@@ -208,17 +208,3 @@ func (e *Engine) ObservedSnapshot() map[string][]ObservedDest {
 	}
 	return out
 }
-
-// Observed returns every currently recorded observed destination for one
-// container, or nil if the engine has recorded nothing for it. Safe to call
-// from any goroutine; see ObservedSnapshot's doc comment.
-func (e *Engine) Observed(containerID string) []ObservedDest {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-
-	oc, ok := e.observed[containerID]
-	if !ok {
-		return nil
-	}
-	return snapshotObservedContainerLocked(oc)
-}

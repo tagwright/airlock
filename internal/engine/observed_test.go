@@ -25,7 +25,7 @@ func TestObserved_UnarmedConnectionRecordsWithDNSName(t *testing.T) {
 		DstIP: dst, DstPort: 443, Proto: "tcp", Timestamp: now,
 	})
 
-	got := e.Observed("c1")
+	got := e.ObservedSnapshot()["c1"]
 	if len(got) != 1 {
 		t.Fatalf("Observed(c1) = %+v, want exactly one entry", got)
 	}
@@ -70,7 +70,7 @@ func TestObserved_ArmedContainerRecordsVerdict(t *testing.T) {
 		DstIP: unresolvedDst, DstPort: 8443, Proto: "tcp", Timestamp: now,
 	})
 
-	got := e.Observed("c1")
+	got := e.ObservedSnapshot()["c1"]
 	if len(got) != 2 {
 		t.Fatalf("Observed(c1) = %+v, want exactly two entries", got)
 	}
@@ -136,7 +136,7 @@ func TestObserved_RepeatedConnectionUpdatesCountAndLastSeen(t *testing.T) {
 		DstIP: dst, DstPort: 443, Proto: "tcp", Timestamp: t1,
 	})
 
-	got := e.Observed("c1")
+	got := e.ObservedSnapshot()["c1"]
 	if len(got) != 1 {
 		t.Fatalf("Observed(c1) = %+v, want exactly one (deduped) entry", got)
 	}
@@ -166,13 +166,13 @@ func TestObserved_ForgetClearsRecorder(t *testing.T) {
 		Kind: observe.Connection, ContainerID: "c1", ContainerName: "x",
 		DstIP: mustAddr("203.0.113.4"), DstPort: 443, Proto: "tcp", Timestamp: now,
 	})
-	if len(e.Observed("c1")) != 1 {
+	if len(e.ObservedSnapshot()["c1"]) != 1 {
 		t.Fatalf("Observed(c1) before Forget: want one entry")
 	}
 
 	e.Forget("c1")
 
-	if got := e.Observed("c1"); len(got) != 0 {
+	if got := e.ObservedSnapshot()["c1"]; len(got) != 0 {
 		t.Errorf("Observed(c1) after Forget = %+v, want none", got)
 	}
 	if snap := e.ObservedSnapshot(); len(snap) != 0 {
@@ -194,7 +194,7 @@ func TestObserved_LoopbackAndOwnNetworkNotRecorded(t *testing.T) {
 		Kind: observe.Connection, ContainerID: "c1", ContainerName: "x",
 		DstIP: mustAddr("127.0.0.1"), DstPort: 443, Proto: "tcp", Timestamp: now,
 	})
-	if got := e.Observed("c1"); len(got) != 0 {
+	if got := e.ObservedSnapshot()["c1"]; len(got) != 0 {
 		t.Errorf("Observed(c1) after loopback connection = %+v, want none recorded", got)
 	}
 }
@@ -216,7 +216,7 @@ func TestObserved_SNIOnlyPopulatesSNINameNotName(t *testing.T) {
 		DstIP: dst, DstPort: 443, Proto: "tcp", Timestamp: now.Add(time.Second),
 	})
 
-	got := e.Observed("c1")
+	got := e.ObservedSnapshot()["c1"]
 	if len(got) != 1 {
 		t.Fatalf("Observed(c1) = %+v, want exactly one entry", got)
 	}

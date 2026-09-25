@@ -1,0 +1,55 @@
+# Wiring-package statement-coverage floors for airlock (Testing Standard
+# enforceability layer, task #552). Format: "<package> <floor-percent>", one
+# per line, blank lines and #-comments ignored.
+#
+# Scoped to the WIRING packages only -- the socket/kernel-event-to-effect layer
+# where this suite's confirmed bugs live -- never a global percentage. A global
+# number rewards testing the cheap pure core and is satisfied while the wiring
+# stays untouched. airlock's wiring is the path a real egress event travels from
+# the kernel to an operator alert:
+#
+#   internal/observe/ig  the kernel-event ingestion backend: spawns the real
+#                        `ig run` subprocess and parses its NDJSON into
+#                        normalized events. Every real-ig bug this suite found
+#                        (nameserver object shape, runc, --auto-mount-filesystems)
+#                        lived here.
+#   internal/discovery   the socket-label-to-validated-spec reader (the frozen
+#                        Airlock Label Grammar), the same wiring role ballast and
+#                        bilgeline floor for their own discovery layer.
+#   internal/resolve     the next stage on that path: merges a container's label
+#                        policy, matching Fork 8 groups, and named policy sets
+#                        into ONE resolved per-container policy. A merge bug here
+#                        is a live policy (security) bug.
+#   internal/engine      turns the normalized observation stream into classified
+#                        Violations against the resolved policy -- the effect
+#                        decision, and the security-critical correlation/match
+#                        core where the SNI-misattribution and trailing-dot bugs
+#                        lived.
+#   internal/daemon      the wiring hub: the event loop that ties observe ->
+#                        engine -> alert together, keeps the live World snapshot,
+#                        and writes the state.json CLI contract.
+#
+# NOT floored, as pure core (parse/validate/derive, no socket/clock): internal/
+# config, internal/policy, internal/secret, internal/alert, internal/cli. The
+# bare internal/observe package is interface and type declarations only (no
+# coverable wiring; the concrete backend it defines is internal/observe/ig,
+# floored above), so it is not floored, the same way a struct-only package is
+# not.
+#
+# This is a ratchet: a floor may only RISE. Raise a number when coverage climbs
+# so a later regression trips the gate; never lower one to make a regression
+# pass (that is the "never weaken a gate" rule the standard forbids).
+#
+# Baselines measured 2026-09-25 on golang:1.25 (deterministic under -count=1),
+# floored to a whole percent at/below the measured value to absorb toolchain
+# rounding:
+#   internal/observe/ig  measured 89.5%
+#   internal/discovery   measured 88.8%
+#   internal/resolve     measured 70.6%
+#   internal/engine      measured 89.3%
+#   internal/daemon      measured 50.2%
+internal/observe/ig 89
+internal/discovery 88
+internal/resolve 70
+internal/engine 89
+internal/daemon 50

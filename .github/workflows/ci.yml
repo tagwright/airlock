@@ -44,3 +44,12 @@ jobs:
 
       - name: Test
         run: go test ./...
+
+      # Enforceability layer (Testing Standard, task #552): skip budget,
+      # wiring-package coverage floor, deadcode, the docs/TESTING.md
+      # gate-check, and the LAST-RUN attestation. All static / go-test-level,
+      # so they run here on the hosted leg, not the self-hosted runner (which
+      # is reserved for the live integration harness). See
+      # test/enforce/README.md.
+      - name: Enforceability checks
+        run: test/enforce/run-all.sh

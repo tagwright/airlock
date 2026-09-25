@@ -164,14 +164,6 @@ func (o Options) withDefaults() Options {
 	return o
 }
 
-// DefaultOptions returns the Options an IGBackend uses when constructed
-// with a zero Options value; it is exposed so callers can start from the
-// defaults and override individual fields (most commonly Images, to pin
-// digests).
-func DefaultOptions() Options {
-	return Options{}.withDefaults()
-}
-
 // source is one gadget this backend supervises: a name (used for logging
 // and Stat.Source), the image to run, and the function that turns one
 // NDJSON line from it into a normalized observe.Event.

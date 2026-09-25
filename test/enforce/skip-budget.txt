@@ -1,0 +1,24 @@
+# Skip budget for airlock (Testing Standard enforceability layer, task #552).
+#
+# INTEGRATION_SKIP_BUDGET is the most t.Skip/t.Skipf/t.SkipNow calls allowed
+# in //go:build integration test files. These are the ALLOWED resource-absent
+# skips: each skips cleanly when its resource (a live external service, a Docker
+# socket) is absent and runs for real under the live harness or when the operator
+# runs it. This number is a ratchet: removing a skip never breaks the build.
+# Raising it is a reviewed change that must name the new resource-absent skip it
+# admits.
+#
+# Skips in NON-integration test files (the always-run `go test ./...` leg) are
+# banned outright, budget 0, enforced by the script with no entry here: that
+# leg has no absent resource to justify a skip, so a skip there is
+# skip-to-get-green.
+#
+# airlock has ZERO //go:build integration Go test files today: its live
+# integration proofs are the shell harness under test/integration/ (run-all.sh
+# and its four scenario scripts), gated on the self-hosted runner, not Go
+# integration-tagged tests. So the integration skip budget is 0. The one skip
+# this repo used to carry was in the always-run leg -- internal/config's
+# TestExampleFileLoads skipped when airlock.example.yml was absent -- but that
+# file is a committed repo file always present in CI, so the skip was
+# skip-to-get-green; it is now a hard t.Fatalf, not a skip.
+INTEGRATION_SKIP_BUDGET=0
