@@ -6,7 +6,7 @@
 # reports a single pass/fail. Runs all of them even if an earlier one fails, so
 # one CI run surfaces every problem at once. The Go-dependent checks (coverage,
 # deadcode) need the toolchain; the text checks (skip budget, TESTING.md,
-# LAST-RUN) do not, but running them all together in the repo golang:1.25 is
+# LAST-RUN) do not, but running them all together in the repo golang:1.25.14 is
 # simplest.
 set -uo pipefail
 
